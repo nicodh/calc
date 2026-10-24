@@ -1,6 +1,7 @@
 import "./App.css";
 import styled from "@emotion/styled";
 import { useEffect, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 import {
   createNewModel,
   loadSelectedModelFromStorage,
@@ -11,16 +12,22 @@ import {
 import {
   type Base,
   type Phase,
+  epochOf,
   getBase,
   getCreatedAt,
   getPhase,
+  hasChanges,
+  heldEntries,
   isEarlier,
   journalAppend,
   journalEntries,
   markEstablished,
   markProvisional,
   rebaseOnto,
+  setHeld,
 } from "./components/bootstrap";
+import FileActions from "./components/FileActions";
+import { modelFromXlsxFile } from "./components/importXlsx";
 import { getDeviceUuid, getSessionId } from "./components/session";
 
 // From IronCalc
@@ -31,13 +38,16 @@ import { Webxdc } from "@webxdc/types";
 import { encode as base64Encode, decode as base64Decode } from "base64-arraybuffer";
 
 // A diff, unless `kind` says the payload carries a whole workbook. A snapshot
-// names the workbook it is, so devices can agree which one is the earliest.
+// names the workbook it is, so devices can agree which one wins, and every
+// update names the generation it belongs to (see components/bootstrap.ts).
 type Payload = {
   data: string;
   sender: string;
   kind?: "snapshot";
+  epoch?: number;
   createdAt?: number;
   session?: number;
+  imported?: boolean;
 };
 
 // How long the update log has to stay quiet before a provisional workbook
@@ -65,6 +75,7 @@ function decode(data: string): Uint8Array {
 }
 
 function App() {
+  const { t } = useTranslation();
   const [model, setModel] = useState<Model | null>(null);
 
   // Bumped whenever we apply a remote diff to the model. We pass this to
@@ -83,7 +94,7 @@ function App() {
   const [phase, setPhase] = useState<Phase>("established");
   // Diffs that arrive while still provisional. They belong to whatever
   // workbook we settle on, so they wait for it.
-  const pendingRef = useRef<{ data: string; serial: number }[]>([]);
+  const pendingRef = useRef<{ data: string; serial: number; epoch: number }[]>([]);
   const quietTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
   // We keep the model in sync with the model ref. We also make sure it's
@@ -162,7 +173,7 @@ function App() {
     saveSelectedModelInStorage(model);
     const data = base64Encode(diff.buffer as ArrayBuffer);
     journalAppend(data);
-    send({ data, sender: uuid });
+    send({ data, sender: uuid, epoch: epochOf(getBase()) });
   }
 
   // Outgoing: flush local edits to peers on an interval.
@@ -183,8 +194,9 @@ function App() {
   }, [uuid])
 
   // Applies a diff to the workbook we have settled on, journals and saves it,
-  // and only then acknowledges it.
-  function applyDiff(model: Model, data: string, serial: number) {
+  // and only then acknowledges it. A diff that was held across a restart has
+  // been acknowledged already.
+  function applyDiff(model: Model, data: string, serial: number | null) {
     try {
       model.applyExternalDiffs(decode(data));
     } catch (error) {
@@ -192,15 +204,37 @@ function App() {
     }
     journalAppend(data);
     saveSelectedModelInStorage(model);
-    localStorage.setItem("last_serial", serial.toString());
+    if (serial !== null) {
+      acknowledge(serial);
+    }
   }
 
+  // Applies the buffered diffs of the generation we are on now, drops those of
+  // older generations, and keeps newer ones waiting for their snapshot.
   function drainPending(model: Model) {
+    const current = epochOf(getBase());
+    const held = heldEntries();
     const pending = pendingRef.current;
     pendingRef.current = [];
-    for (const { data, serial } of pending) {
-      applyDiff(model, data, serial);
+    for (const { data, serial, epoch } of pending) {
+      if (epoch === current) {
+        applyDiff(model, data, serial);
+        continue;
+      }
+      if (epoch > current) {
+        held.push({ data, epoch });
+      }
+      acknowledge(serial);
     }
+    const waiting = [];
+    for (const entry of held) {
+      if (entry.epoch === current) {
+        applyDiff(model, entry.data, null);
+      } else if (entry.epoch > current) {
+        waiting.push(entry);
+      }
+    }
+    setHeld(waiting);
   }
 
   // Replaces the model object; IronCalc remounts on the new one.
@@ -218,7 +252,7 @@ function App() {
     if (!model || phaseRef.current !== "provisional") {
       return
     }
-    const base: Base = { createdAt: getCreatedAt(), session: getSessionId() };
+    const base: Base = { epoch: 0, createdAt: getCreatedAt(), session: getSessionId() };
     // The queue holds the commits that created this workbook. The snapshot
     // replaces them, so they are dropped rather than sent behind it.
     model.flushSendQueue();
@@ -239,13 +273,14 @@ function App() {
     setExternalRevision((revision) => revision + 1);
   }
 
-  // Somebody else's workbook is the shared one, and ours was never more than
-  // a read-only placeholder: take theirs, with our own replica identity.
+  // Takes somebody else's workbook as ours, with our own replica identity:
+  // when ours was never more than a read-only placeholder, and when theirs is
+  // of a newer generation, replacing ours outright.
   function adoptSnapshot(payload: Payload, serial: number) {
     clearTimeout(quietTimer.current);
     const adopted = modelFromBytes(decode(payload.data));
     markEstablished(baseOf(payload));
-    localStorage.setItem("last_serial", serial.toString());
+    acknowledge(serial);
     // Diffs held back while provisional belong to this workbook.
     drainPending(adopted);
     replaceModel(adopted);
@@ -268,11 +303,47 @@ function App() {
       }
     }
     rebaseOnto(base);
-    localStorage.setItem("last_serial", serial.toString());
+    acknowledge(serial);
     replaceModel(rebased);
     if (import.meta.env.DEV) {
       console.log(`[calc] rebased onto an earlier workbook, replayed ${entries.length} updates`);
     }
+  }
+
+  // Replaces the shared workbook with an xlsx file, for everyone: the file
+  // becomes a workbook of the next generation, published as a snapshot. When
+  // the workbook already holds changes, they would be lost, so ask first.
+  async function importWorkbook(file: File) {
+    const model = modelRef.current;
+    if (!model || phaseRef.current !== "established") {
+      return
+    }
+    // What was typed since the last tick goes out first, so the check sees it.
+    flushOutgoing(model);
+    if (hasChanges() && !window.confirm(t("import.replace_warning"))) {
+      return
+    }
+    const imported = await modelFromXlsxFile(file);
+    // The commits that built it; the snapshot carries all of that.
+    imported.flushSendQueue();
+    const base: Base = {
+      epoch: epochOf(getBase()) + 1,
+      createdAt: Date.now(),
+      session: getSessionId(),
+      imported: true,
+    };
+    const data = base64Encode(imported.toBytes().buffer as ArrayBuffer);
+    const limit = window.webxdc.sendUpdateMaxSize || Number.POSITIVE_INFINITY;
+    if (data.length > limit) {
+      // Nobody could receive it, so nothing is replaced.
+      throw new Error(
+        `the imported workbook is ${data.length} bytes, over the host limit of ${limit}`,
+      );
+    }
+    send({ data, sender: uuid, kind: "snapshot", ...base });
+    markEstablished(base);
+    drainPending(imported);
+    replaceModel(imported);
   }
 
   // The armed timer belongs to whichever effect run armed it last, so StrictMode's
@@ -316,25 +387,41 @@ function App() {
         return
       }
       if (payload.sender === uuid) {
-        localStorage.setItem("last_serial", update.serial.toString());
+        acknowledge(update.serial);
         return
       }
       if (payload.kind === "snapshot") {
-        if (phaseRef.current === "provisional") {
+        const theirs = baseOf(payload);
+        const ours = getBase();
+        if (phaseRef.current === "provisional" || epochOf(theirs) > epochOf(ours)) {
           adoptSnapshot(payload, update.serial);
-        } else if (isEarlier(baseOf(payload), getBase())) {
-          rebaseOnSnapshot(model, payload, baseOf(payload)!, update.serial);
+        } else if (epochOf(theirs) === epochOf(ours) && isEarlier(theirs, ours)) {
+          rebaseOnSnapshot(model, payload, theirs!, update.serial);
         } else {
-          // A later workbook than ours. Its diffs apply to ours; the
-          // snapshot itself has nothing for us.
-          localStorage.setItem("last_serial", update.serial.toString());
+          // A later workbook of our generation, whose diffs apply to ours, or
+          // one of an older generation. Either way the snapshot has nothing
+          // for us.
+          acknowledge(update.serial);
         }
         return
       }
+      const epoch = payload.epoch ?? 0;
       if (phaseRef.current === "provisional") {
         // Not acknowledged: a restart replays it.
-        pendingRef.current.push({ data: payload.data, serial: update.serial });
+        pendingRef.current.push({ data: payload.data, serial: update.serial, epoch });
         armQuietTimer();
+        return
+      }
+      const current = epochOf(getBase());
+      if (epoch < current) {
+        // Made on a workbook that has since been replaced.
+        acknowledge(update.serial);
+        return
+      }
+      if (epoch > current) {
+        // Made on a replacement whose snapshot has not reached us yet.
+        setHeld([...heldEntries(), { data: payload.data, epoch }]);
+        acknowledge(update.serial);
         return
       }
       applyDiff(model, payload.data, update.serial);
@@ -365,6 +452,11 @@ function App() {
         revision={externalRevision}
         canEdit={phase === "established"}
       />
+      <FileActions
+        model={model}
+        onImport={importWorkbook}
+        canImport={phase === "established"}
+      />
     </Wrapper>
   );
 }
@@ -373,9 +465,24 @@ function App() {
 // counts as unknown, and loses to any that does.
 function baseOf(payload: Payload): Base | null {
   if (typeof payload.createdAt === "number" && typeof payload.session === "number") {
-    return { createdAt: payload.createdAt, session: payload.session };
+    return {
+      epoch: payload.epoch ?? 0,
+      createdAt: payload.createdAt,
+      session: payload.session,
+      // Only present when set, as on the base a device creates itself.
+      ...(payload.imported === true ? { imported: true } : {}),
+    };
   }
   return null;
+}
+
+// Moves the replay cursor forward, never back: everything below it has been
+// applied, held, or deliberately ignored.
+function acknowledge(serial: number) {
+  const current = parseInt(localStorage.getItem("last_serial") ?? "0", 10) || 0;
+  if (serial > current) {
+    localStorage.setItem("last_serial", serial.toString());
+  }
 }
 
 const Wrapper = styled("div")`

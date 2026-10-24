@@ -130,5 +130,14 @@
   },
   "loading_screen": {
     "message": "Caricamento di IronCalc"
+  },
+  "export": {
+    "send_as_xlsx": "Invia come .xlsx",
+    "failed": "Impossibile esportare questa cartella di lavoro come .xlsx."
+  },
+  "import": {
+    "replace": "Sostituisci la cartella di lavoro con un .xlsx",
+    "replace_warning": "Questa cartella di lavoro contiene già delle modifiche. L'importazione la sostituisce per tutti in questa chat e quelle modifiche vanno perse. Inviala prima come .xlsx per conservarne una copia.\n\nSostituire la cartella di lavoro?",
+    "failed": "Impossibile leggere questo file come foglio di calcolo."
   }
 }

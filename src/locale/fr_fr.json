@@ -130,5 +130,14 @@
   },
   "loading_screen": {
     "message": "Chargement d'IronCalc"
+  },
+  "export": {
+    "send_as_xlsx": "Envoyer en .xlsx",
+    "failed": "Impossible d'exporter ce classeur au format .xlsx."
+  },
+  "import": {
+    "replace": "Remplacer le classeur par un .xlsx",
+    "replace_warning": "Ce classeur contient déjà des modifications. L'importation le remplace pour tous les membres de ce chat, et ces modifications sont perdues. Envoyez-le d'abord en .xlsx pour en garder une copie.\n\nRemplacer le classeur ?",
+    "failed": "Impossible de lire ce fichier comme un tableur."
   }
 }
