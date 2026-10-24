@@ -1,5 +1,6 @@
 import { Model } from "@ironcalc/workbook";
 import i18n from "../i18n";
+import { getSessionId } from "./session";
 import { base64ToBytes, bytesToBase64 } from "./util";
 
 const MAX_WORKBOOKS = 50;
@@ -32,11 +33,12 @@ function getDefaultUILocale(): string {
   return "en-US";
 }
 
-// IronCalc synchronizes edits as diffs carrying the raw user input string
-// and the receiving model re-parses that string with its own locale and
-// language . Function names, argument separators and decimal separators
-// must therefore be identical everywhere. The UI language
-// above is a separate concern and stays per device.
+// The collaborative engine ships edits already parsed - numbers as numbers,
+// formulas as bound token streams - so peers no longer re-parse each other's
+// input, and the engine language (function names) is a local preference that
+// is never synchronized. The locale (decimal and argument separators) is a
+// property of the workbook and shared by everyone. Both stay English for now,
+// as before; a per-device engine language is now possible.
 export const ENGINE_LOCALE = "en";
 export const ENGINE_LANGUAGE = "en";
 // The timezone is a workbook property too: TODAY() and NOW() would otherwise
@@ -58,12 +60,15 @@ function applyEngineSettings(model: Model): Model {
   return model;
 }
 
-// Loads a stored workbook with the shared engine settings. The language is not
-// part of the serialized workbook and is passed in on every load.
+// Builds a workbook from a snapshot - our own stored one, or a peer's - as a
+// replica with this device's session.
+export function modelFromBytes(bytes: Uint8Array): Model {
+  return applyEngineSettings(Model.fromBytes(bytes, getSessionId()));
+}
+
+// Loads a stored workbook with the shared engine settings.
 function modelFromStoredBytes(modelBytesString: string): Model {
-  return applyEngineSettings(
-    Model.from_bytes(base64ToBytes(modelBytesString), ENGINE_LANGUAGE),
-  );
+  return modelFromBytes(base64ToBytes(modelBytesString));
 }
 
 function randomUUID(): string {
@@ -151,6 +156,7 @@ export function createNewModel(): Model {
     ENGINE_LOCALE,
     ENGINE_TIMEZONE,
     ENGINE_LANGUAGE,
+    getSessionId(),
   );
   const uuid = randomUUID();
   localStorage.setItem("selected", uuid);
@@ -316,7 +322,7 @@ export function duplicateModel(uuid: string): Model | null {
   }
 
   const duplicatedModel = applyEngineSettings(
-    Model.from_bytes(originalModel.toBytes(), ENGINE_LANGUAGE),
+    Model.fromBytes(originalModel.toBytes(), getSessionId()),
   );
   const models = getModelsMetadata();
   const originalName = models[uuid].name;
