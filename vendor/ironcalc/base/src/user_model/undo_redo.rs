@@ -4,10 +4,11 @@ use crate::{
     cf_types::ConditionalFormatting,
     constants::COLUMN_WIDTH_FACTOR,
     expressions::types::Area,
-    types::{ArrayKind, Cell, Style},
+    types::{ArrayKind, Cell, RangeRef, Style},
     UserModel,
 };
 
+use crate::user_model::common::selected_sheet_after_move;
 use crate::user_model::history::{Diff, DiffList};
 
 impl<'a> UserModel<'a> {
@@ -33,7 +34,7 @@ impl<'a> UserModel<'a> {
                         .worksheet(*sheet)
                         .ok()
                         .and_then(|ws| ws.cell(*row, *column))
-                        .and_then(|cell| match cell {
+                        .and_then(|cell| match &*cell {
                             Cell::ArrayFormula {
                                 kind: ArrayKind::Dynamic,
                                 r,
@@ -48,7 +49,7 @@ impl<'a> UserModel<'a> {
                                 if r == *row && c == *column {
                                     continue;
                                 }
-                                if matches!(ws.cell(r, c), Some(Cell::SpillCell { a, .. }) if *a == (*row, *column))
+                                if matches!(ws.cell(r, c).as_deref(), Some(Cell::SpillCell { a, .. }) if *a == (*row, *column))
                                 {
                                     let _ = ws.cell_clear_contents(r, c);
                                 }
@@ -197,6 +198,13 @@ impl<'a> UserModel<'a> {
                     column,
                     old_value,
                     new_value: _,
+                }
+                | Diff::ApplyNamedStyle {
+                    sheet,
+                    row,
+                    column,
+                    old_value,
+                    name: _,
                 } => {
                     if let Some(old_style) = old_value.as_ref() {
                         self.model
@@ -214,7 +222,7 @@ impl<'a> UserModel<'a> {
                             .worksheet(*sheet)
                             .ok()
                             .and_then(|ws| ws.cell(*row, *column))
-                            .map(|c| !matches!(c, Cell::EmptyCell { .. }))
+                            .map(|c| !matches!(*c, Cell::EmptyCell { .. }))
                             .unwrap_or(false);
                         if has_content {
                             self.model
@@ -250,7 +258,7 @@ impl<'a> UserModel<'a> {
                         if let Some(row_style) = row_data.row.clone() {
                             worksheet.rows.push(row_style);
                         }
-                        worksheet.sheet_data.insert(r, row_data.data.clone());
+                        worksheet.sheet_data.set_row(r, row_data.data.clone());
                     }
                 }
                 Diff::InsertColumns {
@@ -300,12 +308,41 @@ impl<'a> UserModel<'a> {
                         self.set_selected_sheet(*index - 1)?;
                     }
                 }
+                Diff::DuplicateSheet {
+                    source_index,
+                    new_index,
+                } => {
+                    needs_evaluation = true;
+                    // Remove the defined names that the duplication created
+                    // (they are scoped to the copy's sheet_id) before dropping
+                    // the worksheet itself.
+                    let new_sheet_id = self.model.workbook.worksheet(*new_index)?.sheet_id;
+                    self.model
+                        .workbook
+                        .defined_names
+                        .retain(|dn| dn.sheet_id != Some(new_sheet_id));
+                    self.model.delete_sheet(*new_index)?;
+                    self.set_selected_sheet(*source_index)?;
+                }
                 Diff::RenameSheet {
                     index,
                     old_value,
                     new_value: _,
                 } => {
                     self.model.rename_sheet_by_index(*index, old_value)?;
+                }
+                Diff::MoveSheet {
+                    sheet_index,
+                    new_index,
+                } => {
+                    // Undo a move by moving the sheet back to its original index.
+                    let selected = self.get_selected_sheet();
+                    self.model.move_sheet(*new_index, *sheet_index)?;
+                    self.set_selected_sheet(selected_sheet_after_move(
+                        selected,
+                        *new_index,
+                        *sheet_index,
+                    ))?;
                 }
                 Diff::SetSheetColor {
                     index,
@@ -389,10 +426,8 @@ impl<'a> UserModel<'a> {
                     self.model
                         .insert_sheet(sheet_name, sheet_index, Some(sheet_id))?;
                     let worksheet = self.model.workbook.worksheet_mut(*sheet)?;
-                    for (row, row_data) in &old_data.sheet_data {
-                        for (column, cell) in row_data {
-                            worksheet.update_cell(*row, *column, cell.clone())?;
-                        }
+                    for (row, column, cell) in old_data.sheet_data.cells() {
+                        worksheet.update_cell(row, column, cell.into_owned())?;
                     }
                     worksheet.rows = old_data.rows.clone();
                     worksheet.cols = old_data.cols.clone();
@@ -401,7 +436,7 @@ impl<'a> UserModel<'a> {
                     worksheet.frozen_rows = old_data.frozen_rows;
                     worksheet.state = old_data.state.clone();
                     worksheet.color = old_data.color.clone();
-                    worksheet.merge_cells = old_data.merge_cells.clone();
+                    worksheet.merged_cells = old_data.merged_cells.clone();
                     worksheet.shared_formulas = old_data.shared_formulas.clone();
                     self.model.reset_parsed_structures();
 
@@ -488,7 +523,17 @@ impl<'a> UserModel<'a> {
                 } => {
                     self.model.set_timezone(old_value)?;
                 }
-                Diff::CreateNamedStyle { name, xf_id: _ } => {
+                Diff::SetWorkbookName {
+                    old_value,
+                    new_value: _,
+                } => {
+                    self.model.workbook.name = old_value.clone();
+                }
+                Diff::CreateNamedStyle {
+                    name,
+                    style: _,
+                    includes: _,
+                } => {
                     self.model.workbook.styles.delete_named_style_entry(name)?;
                 }
                 Diff::DeleteNamedStyle { name, old_xf_id } => {
@@ -500,34 +545,13 @@ impl<'a> UserModel<'a> {
                 Diff::UpdateNamedStyle {
                     name,
                     new_name,
-                    old_xf_id,
-                    new_xf_id,
+                    old_style,
+                    new_style: _,
+                    old_includes,
+                    new_includes: _,
                 } => {
-                    if old_xf_id != new_xf_id {
-                        for worksheet in &mut self.model.workbook.worksheets {
-                            for row_data in worksheet.sheet_data.values_mut() {
-                                for cell in row_data.values_mut() {
-                                    if cell.get_style() == *new_xf_id {
-                                        cell.set_style(*old_xf_id);
-                                    }
-                                }
-                            }
-                            for row in &mut worksheet.rows {
-                                if row.s == *new_xf_id {
-                                    row.s = *old_xf_id;
-                                }
-                            }
-                            for col in &mut worksheet.cols {
-                                if col.style == Some(*new_xf_id) {
-                                    col.style = Some(*old_xf_id);
-                                }
-                            }
-                        }
-                    }
                     self.model
-                        .workbook
-                        .styles
-                        .update_named_style_entry(new_name, name, *old_xf_id)?;
+                        .update_named_style(new_name, name, old_style, *old_includes)?;
                 }
                 Diff::AddConditionalFormatting {
                     sheet, priority, ..
@@ -553,7 +577,7 @@ impl<'a> UserModel<'a> {
                         *sheet,
                         *index as usize,
                         ConditionalFormatting {
-                            range: old_range.clone(),
+                            ranges: RangeRef::parse_sqref(old_range),
                             cf_rule: *old_rule.clone(),
                             priority: *old_priority,
                         },
@@ -572,12 +596,50 @@ impl<'a> UserModel<'a> {
                     let i = *index as usize;
                     if i < ws.conditional_formatting.len() {
                         ws.conditional_formatting[i] = ConditionalFormatting {
-                            range: old_range.clone(),
+                            ranges: RangeRef::parse_sqref(old_range),
                             cf_rule: *old_rule.clone(),
                             priority: *old_priority,
                         };
                     }
                     needs_evaluation = true;
+                }
+                Diff::SwapConditionalFormattingPriority {
+                    sheet,
+                    index_a,
+                    index_b,
+                    priority_a,
+                    priority_b,
+                } => {
+                    // Undo: restore each rule's original priority.
+                    let ws = self.model.workbook.worksheet_mut(*sheet)?;
+                    if let Some(cf) = ws.conditional_formatting.get_mut(*index_a as usize) {
+                        cf.priority = *priority_a;
+                    }
+                    if let Some(cf) = ws.conditional_formatting.get_mut(*index_b as usize) {
+                        cf.priority = *priority_b;
+                    }
+                    needs_evaluation = true;
+                }
+                Diff::SetCellLink {
+                    sheet,
+                    row,
+                    column,
+                    old_value,
+                    new_value: _,
+                } => match old_value.as_ref() {
+                    Some(link) => self
+                        .model
+                        .set_cell_link(*sheet, *row, *column, link.clone())?,
+                    None => self.model.delete_cell_link(*sheet, *row, *column)?,
+                },
+                Diff::SetMergedCells {
+                    sheet,
+                    old_value,
+                    new_value: _,
+                } => {
+                    // Merged cells block spilling, so a change can affect results
+                    needs_evaluation = true;
+                    self.model.workbook.worksheet_mut(*sheet)?.merged_cells = old_value.clone();
                 }
             }
         }
@@ -695,6 +757,31 @@ impl<'a> UserModel<'a> {
                 } => self
                     .model
                     .set_cell_style(*sheet, *row, *column, new_value)?,
+                Diff::ApplyNamedStyle {
+                    sheet,
+                    row,
+                    column,
+                    old_value: _,
+                    name,
+                } => {
+                    // The undo restored the cell's pre-apply format, so the
+                    // merge can be replayed against the cell's current state.
+                    let current_index = self
+                        .model
+                        .workbook
+                        .worksheet(*sheet)?
+                        .get_style(*row, *column);
+                    let style_index = self
+                        .model
+                        .workbook
+                        .styles
+                        .get_style_index_for_applied_style(name, current_index)?;
+                    self.model.workbook.worksheet_mut(*sheet)?.set_cell_style(
+                        *row,
+                        *column,
+                        style_index,
+                    )?;
+                }
                 Diff::InsertRows { sheet, row, count } => {
                     self.model.insert_rows(*sheet, *row, *count)?;
                     needs_evaluation = true;
@@ -745,12 +832,34 @@ impl<'a> UserModel<'a> {
                     self.model.insert_sheet(name, *index, None)?;
                     self.set_selected_sheet(*index)?;
                 }
+                Diff::DuplicateSheet {
+                    source_index,
+                    new_index,
+                } => {
+                    needs_evaluation = true;
+                    // `duplicate_sheet` is deterministic given the workbook
+                    // state, so re-running it reproduces the same copy.
+                    self.model.duplicate_sheet(*source_index)?;
+                    self.set_selected_sheet(*new_index)?;
+                }
                 Diff::RenameSheet {
                     index,
                     old_value: _,
                     new_value,
                 } => {
                     self.model.rename_sheet_by_index(*index, new_value)?;
+                }
+                Diff::MoveSheet {
+                    sheet_index,
+                    new_index,
+                } => {
+                    let selected = self.get_selected_sheet();
+                    self.model.move_sheet(*sheet_index, *new_index)?;
+                    self.set_selected_sheet(selected_sheet_after_move(
+                        selected,
+                        *sheet_index,
+                        *new_index,
+                    ))?;
                 }
                 Diff::SetSheetColor {
                     index,
@@ -872,11 +981,21 @@ impl<'a> UserModel<'a> {
                 } => {
                     self.model.set_timezone(new_value)?;
                 }
-                Diff::CreateNamedStyle { name, xf_id } => {
+                Diff::SetWorkbookName {
+                    old_value: _,
+                    new_value,
+                } => {
+                    self.model.workbook.name = new_value.clone();
+                }
+                Diff::CreateNamedStyle {
+                    name,
+                    style,
+                    includes,
+                } => {
                     self.model
                         .workbook
                         .styles
-                        .add_named_cell_style(name, *xf_id)?;
+                        .create_named_style(name, style, *includes)?;
                 }
                 Diff::DeleteNamedStyle { name, old_xf_id: _ } => {
                     self.model.workbook.styles.delete_named_style_entry(name)?;
@@ -884,34 +1003,13 @@ impl<'a> UserModel<'a> {
                 Diff::UpdateNamedStyle {
                     name,
                     new_name,
-                    old_xf_id,
-                    new_xf_id,
+                    old_style: _,
+                    new_style,
+                    old_includes: _,
+                    new_includes,
                 } => {
-                    if old_xf_id != new_xf_id {
-                        for worksheet in &mut self.model.workbook.worksheets {
-                            for row_data in worksheet.sheet_data.values_mut() {
-                                for cell in row_data.values_mut() {
-                                    if cell.get_style() == *old_xf_id {
-                                        cell.set_style(*new_xf_id);
-                                    }
-                                }
-                            }
-                            for row in &mut worksheet.rows {
-                                if row.s == *old_xf_id {
-                                    row.s = *new_xf_id;
-                                }
-                            }
-                            for col in &mut worksheet.cols {
-                                if col.style == Some(*old_xf_id) {
-                                    col.style = Some(*new_xf_id);
-                                }
-                            }
-                        }
-                    }
                     self.model
-                        .workbook
-                        .styles
-                        .update_named_style_entry(name, new_name, *new_xf_id)?;
+                        .update_named_style(name, new_name, new_style, *new_includes)?;
                 }
                 Diff::AddConditionalFormatting {
                     sheet,
@@ -929,7 +1027,7 @@ impl<'a> UserModel<'a> {
                         *sheet,
                         len,
                         ConditionalFormatting {
-                            range: range.clone(),
+                            ranges: RangeRef::parse_sqref(range),
                             cf_rule: *rule.clone(),
                             priority: *priority,
                         },
@@ -951,10 +1049,48 @@ impl<'a> UserModel<'a> {
                     let ws = self.model.workbook.worksheet_mut(*sheet)?;
                     let i = *index as usize;
                     if i < ws.conditional_formatting.len() {
-                        ws.conditional_formatting[i].range = new_range.clone();
+                        ws.conditional_formatting[i].ranges = RangeRef::parse_sqref(new_range);
                         ws.conditional_formatting[i].cf_rule = *new_rule.clone();
                     }
                     needs_evaluation = true;
+                }
+                Diff::SwapConditionalFormattingPriority {
+                    sheet,
+                    index_a,
+                    index_b,
+                    priority_a,
+                    priority_b,
+                } => {
+                    // Apply/redo: swap the two priorities.
+                    let ws = self.model.workbook.worksheet_mut(*sheet)?;
+                    if let Some(cf) = ws.conditional_formatting.get_mut(*index_a as usize) {
+                        cf.priority = *priority_b;
+                    }
+                    if let Some(cf) = ws.conditional_formatting.get_mut(*index_b as usize) {
+                        cf.priority = *priority_a;
+                    }
+                    needs_evaluation = true;
+                }
+                Diff::SetCellLink {
+                    sheet,
+                    row,
+                    column,
+                    old_value: _,
+                    new_value,
+                } => match new_value.as_ref() {
+                    Some(link) => self
+                        .model
+                        .set_cell_link(*sheet, *row, *column, link.clone())?,
+                    None => self.model.delete_cell_link(*sheet, *row, *column)?,
+                },
+                Diff::SetMergedCells {
+                    sheet,
+                    old_value: _,
+                    new_value,
+                } => {
+                    // Merged cells block spilling, so a change can affect results
+                    needs_evaluation = true;
+                    self.model.workbook.worksheet_mut(*sheet)?.merged_cells = new_value.clone();
                 }
             }
         }

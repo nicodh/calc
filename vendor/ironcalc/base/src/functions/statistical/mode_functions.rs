@@ -2,11 +2,12 @@ use std::collections::HashMap;
 
 use crate::expressions::parser::ArrayNode;
 use crate::expressions::types::CellReferenceIndex;
+use crate::types::Position;
 use crate::{
     calc_result::CalcResult, expressions::parser::Node, expressions::token::Error, model::Model,
 };
 
-impl<'a> Model<'a> {
+impl<'a, A: Position> Model<'a, A> {
     fn collect_mode_values(
         &mut self,
         args: &[Node],
@@ -15,10 +16,10 @@ impl<'a> Model<'a> {
         let mut values = Vec::new();
         for arg in args {
             match self.evaluate_node_in_context(arg, cell) {
-                CalcResult::Range { left, right } => match self.values_from_range(left, right) {
-                    Ok(v) => values.extend(v.into_iter().flatten()),
-                    Err(e) => return Err(e),
-                },
+                CalcResult::Range { left, right } => {
+                    let v = self.values_from_range(left, right)?;
+                    values.extend(v.into_iter().flatten())
+                }
                 CalcResult::Array(arr) => match self.values_from_array(arr) {
                     Ok(v) => values.extend(v.into_iter().flatten()),
                     Err(e) => {

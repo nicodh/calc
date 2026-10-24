@@ -10,7 +10,7 @@
 //!    This is for user formulas. References are like `D4`, `D$4` or `F5:T10`
 //! 2. R1C1, internal or runtime mode
 //!    A reference like R1C1 refers to $A$1 and R3C4 to $D$4
-//!    R[2]C[5] refers to a cell two rows below and five columns to the right
+//!    `R[2]C[5]` refers to a cell two rows below and five columns to the right
 //!    It uses the 'en' locale and language.
 //!    This is used internally at runtime.
 //!
@@ -47,6 +47,7 @@ use std::mem;
 use serde::{Deserialize, Serialize};
 
 use crate::expressions::token::{OpCompare, OpProduct, OpSum};
+use crate::number_format::parse_finite_number;
 
 use crate::language::Language;
 use crate::locale::Locale;
@@ -91,6 +92,11 @@ fn is_valid_r1c1_identifier(name: &str, next_char: Option<char>) -> bool {
     // `is_valid_identifier` differs from `is_valid_a1_identifier` only for "R"/"C".
     // For those, only reject when they start a (malformed) reference, i.e. `R[`.
     utils::is_valid_identifier(name) || next_char != Some('[')
+}
+
+/// A character that can be part of an identifier (see `consume_identifier`)
+fn is_identifier_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '.'
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -273,7 +279,10 @@ impl<'a> Lexer<'a> {
                         }
                     }
                     '#' => self.consume_error(),
-                    '"' => TokenType::String(self.consume_string()),
+                    '"' => match self.consume_string() {
+                        Ok(s) => TokenType::String(s),
+                        Err(error) => TokenType::Illegal(error),
+                    },
                     '\'' => self.consume_quoted_sheet_reference(),
                     '0'..='9' => {
                         let position = self.position - 1;
@@ -509,14 +518,14 @@ impl<'a> Lexer<'a> {
         let position = self.position;
         if position >= self.len {
             return Err(self.set_error(
-                &format!("Error, expected {} found EOF", &ch_expected),
+                &format!("Error, expected {} found EOF", ch_expected),
                 self.position,
             ));
         } else {
             let ch = self.chars[position];
             if ch_expected != ch {
                 return Err(self.set_error(
-                    &format!("Error, expected {} found {}", &ch_expected, &ch),
+                    &format!("Error, expected {} found {}", ch_expected, ch),
                     self.position,
                 ));
             }
@@ -612,9 +621,11 @@ impl<'a> Lexer<'a> {
             }
         }
         self.position = position;
-        match chars.parse::<f64>() {
-            Err(_) => Err(self.set_error(&format!("Failed to parse to double: {chars}"), position)),
-            Ok(v) => Ok(v),
+        // A number too large to hold, like 1e400, is not a number: it would
+        // be infinity, which cannot be written back as a formula.
+        match parse_finite_number(&chars) {
+            None => Err(self.set_error(&format!("Failed to parse to double: {chars}"), position)),
+            Some(v) => Ok(v),
         }
     }
 
@@ -634,10 +645,11 @@ impl<'a> Lexer<'a> {
         chars
     }
 
-    fn consume_string(&mut self) -> String {
+    fn consume_string(&mut self) -> Result<String> {
         let mut position = self.position;
         let len = self.len;
         let mut chars = "".to_string();
+        let mut terminated = false;
         while position < len {
             let x = self.chars[position];
             position += 1;
@@ -648,11 +660,16 @@ impl<'a> Lexer<'a> {
                 chars.push(self.chars[position]);
                 position += 1;
             } else {
+                terminated = true;
                 break;
             }
         }
         self.position = position;
-        chars
+
+        if !terminated {
+            return Err(self.set_error("Expected closing '\"' but found end of input", position));
+        }
+        Ok(chars)
     }
 
     // Consumes a quoted string from input
@@ -782,6 +799,7 @@ impl<'a> Lexer<'a> {
     }
 
     fn consume_range(&mut self, sheet: Option<String>) -> TokenType {
+        let start = self.position;
         let m = if self.mode == LexerMode::A1 {
             self.consume_range_a1()
         } else {
@@ -789,6 +807,13 @@ impl<'a> Lexer<'a> {
         };
         match m {
             Ok(ParsedRange { left, right }) => {
+                // `Sheet1!Q1_Total`: the reference is only the start of a
+                // longer identifier, a defined name
+                if sheet.is_some() && self.peek_char().is_some_and(is_identifier_char) {
+                    if let Some(sheet) = sheet {
+                        return self.consume_qualified_identifier(sheet, start, None);
+                    }
+                }
                 if let Some(right) = right {
                     TokenType::Range { sheet, left, right }
                 } else {
@@ -801,7 +826,38 @@ impl<'a> Lexer<'a> {
                     }
                 }
             }
-            Err(error) => TokenType::Illegal(error),
+            Err(error) => match sheet {
+                // `Sheet1!Name` is not a reference, but could be a defined name
+                Some(sheet) => self.consume_qualified_identifier(sheet, start, Some(error)),
+                None => TokenType::Illegal(error),
+            },
         }
+    }
+
+    /// What follows `Sheet1!` when it is not a complete reference: a defined
+    /// name qualified with a sheet (`Sheet1!MyName`), or else an error (the
+    /// original one if there was one).
+    fn consume_qualified_identifier(
+        &mut self,
+        sheet: String,
+        position: usize,
+        error: Option<LexerError>,
+    ) -> TokenType {
+        self.position = position;
+        let name = self.consume_identifier();
+        let is_valid = match self.mode {
+            LexerMode::A1 => utils::is_valid_a1_identifier(&name),
+            LexerMode::R1C1 => {
+                let next_char = self.peek_char();
+                is_valid_r1c1_identifier(&name, next_char)
+            }
+        };
+        if !name.is_empty() && is_valid {
+            return TokenType::QualifiedIdent { sheet, name };
+        }
+        let error =
+            error.unwrap_or_else(|| self.set_error("Invalid reference or identifier", position));
+        self.position = self.len;
+        TokenType::Illegal(error)
     }
 }

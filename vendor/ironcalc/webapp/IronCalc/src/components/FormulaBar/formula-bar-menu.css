@@ -23,14 +23,14 @@
   top: calc(100% + 4px);
   left: -4px;
   z-index: 1000;
+  box-sizing: border-box;
   max-width: min(400px, calc(100vw - 16px));
+  overflow-y: auto;
   padding: 4px 0;
-  border: 1px solid var(--palette-grey-200);
+  border: 1px solid var(--palette-surface-elevated-border);
   border-radius: 8px;
-  background: var(--palette-common-white);
-  box-shadow:
-    0px 4px 10px rgba(0, 0, 0, 0.12),
-    0px 2px 4px rgba(0, 0, 0, 0.08);
+  background: var(--palette-surface-elevated);
+  box-shadow: var(--shadow-md);
   min-width: 0;
   width: max-content;
 }
@@ -59,7 +59,7 @@
 }
 
 .ic-formula-bar-menu-item:hover:not(:disabled) {
-  background: var(--palette-grey-50);
+  background: var(--palette-grey-200);
 }
 
 .ic-formula-bar-menu-item:focus-visible {

@@ -1,5 +1,5 @@
 use super::{
-    stringify::{stringify_reference, DisplaceData},
+    stringify::{defined_name_to_string, stringify_reference, DisplaceData},
     ArrayNode, Node, Reference,
 };
 use crate::{
@@ -474,7 +474,7 @@ fn to_string_moved(
             // Enclose the whole matrix in braces
             format!("{{{matrix_string}}}")
         }
-        DefinedNameKind((name, ..)) => name.to_string(),
+        DefinedNameKind { name, sheet, .. } => defined_name_to_string(name, sheet),
         TableNameKind(name) => name.to_string(),
         NamedVariableKind { name, id: _ } => name.to_string(),
         CompareKind { kind, left, right } => format!(
@@ -484,21 +484,34 @@ fn to_string_moved(
             to_string_moved(right, move_context, locale, language),
         ),
         UnaryKind { kind, right } => match kind {
-            OpUnary::Minus => format!(
-                "-{}",
-                to_string_moved(right, move_context, locale, language)
-            ),
+            OpUnary::Minus => {
+                let x = to_string_moved(right, move_context, locale, language);
+                // What binds less than the minus needs its parentheses:
+                // `-(A1=B1)` is not `-A1=B1`
+                let needs_parentheses = matches!(
+                    **right,
+                    OpPowerKind { .. }
+                        | OpSumKind { .. }
+                        | OpConcatenateKind { .. }
+                        | CompareKind { .. }
+                        | UnaryKind {
+                            kind: OpUnary::Percentage,
+                            ..
+                        }
+                );
+                if needs_parentheses {
+                    format!("-({x})")
+                } else {
+                    format!("-{x}")
+                }
+            }
             OpUnary::Percentage => format!(
                 "{}%",
                 to_string_moved(right, move_context, locale, language)
             ),
         },
         ErrorKind(kind) => format!("{kind}"),
-        ParseErrorKind {
-            formula,
-            message: _,
-            position: _,
-        } => formula.to_string(),
+        ParseErrorKind { formula, .. } => formula.to_string(),
         EmptyArgKind => "".to_string(),
         ImplicitIntersection {
             automatic: _,

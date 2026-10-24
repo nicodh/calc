@@ -2,7 +2,9 @@
 
 use crate::cell::CellValue;
 use crate::test::util::new_empty_model;
-use crate::types::{ArrayKind, Cell, CellType, FormulaValue};
+#[cfg(not(feature = "collab-test"))]
+use crate::types::{ArrayKind, FormulaValue};
+use crate::types::{Cell, CellType};
 
 #[test]
 fn test_cell_get_type() {
@@ -43,6 +45,7 @@ fn test_cell_get_type() {
     assert_eq!(model._get_cell("A15").get_type(), CellType::Text);
 }
 
+#[cfg(not(feature = "collab-test"))]
 #[test]
 fn cell_is_always_dynamic() {
     let mut model = new_empty_model();
@@ -51,13 +54,19 @@ fn cell_is_always_dynamic() {
     model._set("B2", "=CELL(\"contents\", A2)");
     model.evaluate();
 
-    let b1_cell = model.workbook.worksheets[0].sheet_data[&1][&2].clone();
+    let b1_cell = model.workbook.worksheets[0]
+        .cell(1, 2)
+        .unwrap()
+        .into_owned();
     assert!(matches!(
         b1_cell,
         Cell::ArrayFormula { kind: ArrayKind::Dynamic, v: FormulaValue::Text(ref v), .. } if v == "$A$1"
     ));
 
-    let b2_cell = model.workbook.worksheets[0].sheet_data[&2][&2].clone();
+    let b2_cell = model.workbook.worksheets[0]
+        .cell(2, 2)
+        .unwrap()
+        .into_owned();
     assert!(matches!(
         b2_cell,
         Cell::ArrayFormula { kind: ArrayKind::Dynamic, v: FormulaValue::Number(v), .. } if v == 0.0
@@ -73,6 +82,7 @@ fn test_cell_get_text_on_boolean_cell() {
     assert_eq!(model.get_localized_cell_content(0, 1, 1).unwrap(), "TRUE");
 }
 
+#[cfg(not(feature = "collab-test"))]
 #[test]
 fn test_cell_value_on_empty_shared_string() {
     let mut model = new_empty_model();

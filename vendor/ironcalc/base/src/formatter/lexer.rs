@@ -1,3 +1,5 @@
+use crate::number_format::parse_finite_number;
+
 pub struct Lexer {
     position: usize,
     len: usize,
@@ -192,7 +194,7 @@ impl Lexer {
             }
         }
         self.position = position;
-        chars.parse::<f64>().ok()
+        parse_finite_number(&chars)
     }
 
     fn consume_condition(&mut self) -> Option<(Compare, f64)> {
@@ -222,12 +224,17 @@ impl Lexer {
             }
         }
 
-        if let Some(v) = self.consume_number() {
-            if self.read_next_char() == Some(']') {
-                return Some((cmp, v));
-            }
-        } else if self.read_next_char() == Some(']') {
-            return Some((cmp, 0.0));
+        let start = self.position;
+        let value = match self.consume_number() {
+            Some(v) => v,
+            // Without a number, as in `[>]`, the condition compares with 0
+            None if self.position == start => 0.0,
+            // There is something that should be a number and is not one,
+            // like `1e400` that is too large to hold: that is no condition
+            None => return None,
+        };
+        if self.read_next_char() == Some(']') {
+            return Some((cmp, value));
         }
         None
     }
@@ -344,9 +351,26 @@ impl Lexer {
                                 Token::ILLEGAL
                             }
                         } else if c == '$' {
-                            // currency
+                            // currency: [$<symbol>] or [$<symbol>-<locale>]
+                            // IronCalc ignores the currency/locale modifiers for now
+                            // They are of two types:
+                            //  * BCP-47 locale tag (like [$€-fr-FR])
+                            //  * hex LCID (old format)
+                            //      Like [$$-409] (=1033 for en-US) or
+                            //           [$$-40C] (=1036 for fr-FR)
                             self.read_next_char();
                             if let Some(currency) = self.read_next_char() {
+                                // ignore the locale part for now, just check if it ends with ']'
+                                if Some('-') == self.peek_char() {
+                                    self.read_next_char();
+
+                                    while let Some(c) = self.peek_char() {
+                                        if c == ']' {
+                                            break;
+                                        }
+                                        self.read_next_char();
+                                    }
+                                }
                                 if self.read_next_char() == Some(']') {
                                     return Token::Currency(currency);
                                 }
@@ -417,11 +441,15 @@ impl Lexer {
                         Token::ILLEGAL
                     }
                 }
-                'd' => {
+                'd' | 'D' => {
                     let mut d = 1;
-                    while let Some('d') = self.peek_char() {
-                        d += 1;
-                        self.read_next_char();
+                    while let Some(c) = self.peek_char() {
+                        if c.eq_ignore_ascii_case(&'d') {
+                            d += 1;
+                            self.read_next_char();
+                        } else {
+                            break;
+                        }
                     }
                     match d {
                         1 => Token::Day,
@@ -430,11 +458,15 @@ impl Lexer {
                         _ => Token::DayName,
                     }
                 }
-                'm' => {
+                'm' | 'M' => {
                     let mut m = 1;
-                    while let Some('m') = self.peek_char() {
-                        m += 1;
-                        self.read_next_char();
+                    while let Some(c) = self.peek_char() {
+                        if c.eq_ignore_ascii_case(&'m') {
+                            m += 1;
+                            self.read_next_char();
+                        } else {
+                            break;
+                        }
                     }
                     match m {
                         1 => Token::Month,       // (or minute)
@@ -445,11 +477,15 @@ impl Lexer {
                         _ => Token::MonthName,
                     }
                 }
-                'y' => {
+                'y' | 'Y' => {
                     let mut y = 1;
-                    while let Some('y') = self.peek_char() {
-                        y += 1;
-                        self.read_next_char();
+                    while let Some(c) = self.peek_char() {
+                        if c.eq_ignore_ascii_case(&'y') {
+                            y += 1;
+                            self.read_next_char();
+                        } else {
+                            break;
+                        }
                     }
                     if y == 1 || y == 2 {
                         Token::YearShort
@@ -476,11 +512,15 @@ impl Lexer {
                         Token::ILLEGAL
                     }
                 }
-                's' => {
+                's' | 'S' => {
                     let mut s = 1;
-                    while let Some('s') = self.peek_char() {
-                        s += 1;
-                        self.read_next_char();
+                    while let Some(c) = self.peek_char() {
+                        if c.eq_ignore_ascii_case(&'s') {
+                            s += 1;
+                            self.read_next_char();
+                        } else {
+                            break;
+                        }
                     }
                     if s == 1 {
                         Token::Second

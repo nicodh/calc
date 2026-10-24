@@ -14,14 +14,16 @@ import {
   Keyboard,
   Menu as MenuIcon,
   Plus,
+  Sun,
   Table2,
   Trash2,
 } from "lucide-react";
 import { useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import DeleteWorkbookDialog from "../DeleteWorkbookDialog";
-import { getModelsMetadata, getSelectedUuid } from "../storage";
+import type { ThemeMode } from "../storage";
 import UploadFileDialog from "../UploadFileDialog/UploadFileDialog";
+import { useModelsMetadata, useSelectedUuid } from "../useStorage";
 
 const LANGUAGES = [
   ["en-US", "English"],
@@ -32,13 +34,21 @@ const LANGUAGES = [
   ["it-IT", "Italiano"],
 ] as const;
 
+const THEMES: [ThemeMode, string][] = [
+  ["light", "file_bar.file_menu.appearance_light"],
+  ["dark", "file_bar.file_menu.appearance_dark"],
+];
+
 interface MobileMenuProps {
   newModel: () => void;
   newModelFromTemplate: () => void;
   onDownload: () => Promise<void>;
   onModelUpload: (blob: ArrayBuffer, fileName: string) => Promise<void>;
   onDelete: () => void;
+  isReadOnly: boolean;
   onLanguageChange: (language: string) => void;
+  themeMode: ThemeMode;
+  onThemeModeChange: (mode: ThemeMode) => void;
 }
 
 export function MobileMenu(props: MobileMenuProps) {
@@ -48,8 +58,8 @@ export function MobileMenu(props: MobileMenuProps) {
   const [isDeleteDialogOpen, setDeleteDialogOpen] = useState(false);
   const [anchorPosition, setAnchorPosition] = useState({ x: 0, y: 0 });
   const triggerRef = useRef<HTMLButtonElement>(null);
-  const models = getModelsMetadata();
-  const selectedUuid = getSelectedUuid();
+  const models = useModelsMetadata();
+  const selectedUuid = useSelectedUuid();
 
   const handleOpen = () => {
     const rect = triggerRef.current?.getBoundingClientRect();
@@ -95,6 +105,7 @@ export function MobileMenu(props: MobileMenuProps) {
         </MenuItem>
         <MenuItem
           destructive
+          disabled={props.isReadOnly}
           icon={<Trash2 />}
           onClick={() => setDeleteDialogOpen(true)}
         >
@@ -118,6 +129,20 @@ export function MobileMenu(props: MobileMenuProps) {
           ))}
         >
           {t("file_bar.file_menu.default_language")}
+        </MenuItemWithSubmenu>
+        <MenuItemWithSubmenu
+          icon={<Sun />}
+          submenu={THEMES.map(([mode, labelKey]) => (
+            <MenuItem
+              key={labelKey}
+              checked={props.themeMode === mode}
+              onClick={() => props.onThemeModeChange(mode)}
+            >
+              {t(labelKey)}
+            </MenuItem>
+          ))}
+        >
+          {t("file_bar.file_menu.appearance")}
         </MenuItemWithSubmenu>
         <MenuDivider />
         <MenuItem

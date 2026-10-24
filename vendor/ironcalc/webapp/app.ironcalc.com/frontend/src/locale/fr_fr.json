@@ -5,7 +5,12 @@
   "default_workbook_name": "Classeur",
   "errors": {
     "model_not_found": "Modèle introuvable ou échec du chargement",
-    "example_not_found": "Fichier d'exemple introuvable ou échec du chargement"
+    "example_not_found": "Fichier d'exemple introuvable ou échec du chargement",
+    "storage_save_failed": "Vos modifications n'ont pas pu être enregistrées. Le navigateur n'a peut-être plus d'espace de stockage."
+  },
+  "unsaved_bar": {
+    "message": "Vous consultez un classeur en lecture seule. Enregistrez une copie pour le modifier.",
+    "save_copy": "Enregistrer une copie"
   },
   "welcome_dialog": {
     "title": "Bienvenue sur IronCalc",
@@ -27,8 +32,6 @@
       "category_games": "Jeux",
       "yearly_calendar": "Calendrier annuel",
       "yearly_calendar_description": "Planifiez et visualisez toute l'année.",
-      "mortgage_calculator": "Calculateur hypothécaire",
-      "mortgage_calculator_description": "Estimez les paiements, les intérêts et le coût total.",
       "crossword": "Mots croisés",
       "crossword_description": "Remplissez la grille et résolvez les indices.",
       "travel_expenses_tracker": "Suivi des frais de voyage",
@@ -39,10 +42,6 @@
       "gantt_project_tracker_description": "Planifiez les tâches et les échéances sur un diagramme de Gantt.",
       "weekly_timesheet": "Feuille de temps hebdomadaire",
       "weekly_timesheet_description": "Saisissez et vérifiez les heures travaillées chaque semaine.",
-      "eu_salary_calculator": "Calculateur de salaire UE",
-      "eu_salary_calculator_description": "Estimez le salaire net après impôts dans l'UE.",
-      "absence_schedule": "Planning des absences",
-      "absence_schedule_description": "Suivez les congés et absences de l'équipe.",
       "wordle": "Wordle",
       "wordle_description": "Devinez le mot caché de cinq lettres.",
       "event_calendar": "Calendrier des événements",
@@ -57,6 +56,7 @@
     "search_workbook": "Rechercher des classeurs",
     "search_placeholder": "Rechercher un classeur...",
     "clear_search": "Effacer la recherche",
+    "empty_state": "Aucun classeur pour le moment. Les classeurs que vous créez ou enregistrez apparaîtront ici.",
     "search_no_results": "Votre recherche ne correspond à aucun classeur.",
     "pinned": "Épinglés",
     "today": "Aujourd'hui",
@@ -70,22 +70,20 @@
       "delete": "Supprimer le classeur"
     },
     "alert": {
-      "title": "Attention !",
-      "subtitle": "IronCalc stocke vos données uniquement dans le stockage local de votre navigateur.",
-      "subtitle2": "<bold>Téléchargez souvent votre XLSX</bold> – les versions futures pourraient ne pas ouvrir les classeurs actuels, même s'ils sont partagés.",
       "close": "Fermer"
     },
     "documentation": "Documentation",
     "cancel": "Annuler",
     "delete_workbooks_one": "Supprimer {{count}} classeur",
     "delete_workbooks_other": "Supprimer {{count}} classeurs",
-    "bulk_delete_message_one": "Ce classeur sera définitivement supprimé.",
-    "bulk_delete_message_other": "{{count}} classeurs seront définitivement supprimés.",
+    "bulk_delete_message_one": "Ce classeur sera définitivement supprimé. Les liens déjà partagés continueront de fonctionner.",
+    "bulk_delete_message_other": "{{count}} classeurs seront définitivement supprimés. Les liens déjà partagés continueront de fonctionner.",
     "select_workbook": "Sélectionner {{name}}"
   },
   "file_bar": {
     "open_sidebar": "Ouvrir la barre latérale",
     "close_sidebar": "Fermer la barre latérale",
+    "cloud_warning": "<warn>Attention !</warn> Cette application est une preuve de concept et non un produit fini. N'hésitez pas à explorer, partager et importer/télécharger des modèles, mais ne partagez pas et n'importez pas de modèles contenant des données sensibles ou privées. Les données seront supprimées périodiquement.",
     "file_menu": {
       "button": "Fichier",
       "new_blank_workbook": "Nouveau classeur vierge",
@@ -105,11 +103,14 @@
         "button": "Supprimer le classeur",
         "title": "Êtes-vous sûr ?",
         "subtitle": "Le classeur '{{workbookName}}' sera définitivement supprimé.",
-        "warning": "Cette action ne peut pas être annulée.",
+        "warning": "Cette action ne peut pas être annulée. Les liens déjà partagés continueront de fonctionner.",
         "confirm_button": "Oui, supprimer",
         "cancel_button": "Annuler"
       },
-      "default_language": "Langue par défaut"
+      "default_language": "Langue par défaut",
+      "appearance": "Apparence",
+      "appearance_light": "Clair",
+      "appearance_dark": "Sombre"
     },
     "help_menu": {
       "button": "Aide",
@@ -117,15 +118,11 @@
       "documentation": "Documentation",
       "keyboard_shortcuts": "Raccourcis clavier"
     },
-    "title_input": {
-      "warning_text1": "Ce classeur est stocké uniquement dans votre navigateur. Pour le conserver en sécurité, téléchargez-le au format .xlsx.",
-      "warning_text2": " Les versions futures pourraient être incompatibles."
-    },
     "share_popover": {
       "button": "Partager",
       "copy_url": "Copier l'URL",
       "copied": "Copié !",
-      "info_text": "Toute personne disposant du lien pourra accéder à une copie de ce classeur"
+      "info_text": "Toute personne disposant du lien pourra accéder à une copie de ce classeur. Les liens partagés ne peuvent pas être supprimés."
     }
   },
   "loading_screen": {

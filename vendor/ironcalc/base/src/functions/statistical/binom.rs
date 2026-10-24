@@ -1,11 +1,12 @@
 use statrs::distribution::{Binomial, Discrete, DiscreteCDF};
 
 use crate::expressions::types::CellReferenceIndex;
+use crate::types::Position;
 use crate::{
     calc_result::CalcResult, expressions::parser::Node, expressions::token::Error, model::Model,
 };
 
-impl<'a> Model<'a> {
+impl<'a, A: Position> Model<'a, A> {
     pub(crate) fn fn_binom_dist(&mut self, args: &[Node], cell: CellReferenceIndex) -> CalcResult {
         if args.len() != 4 {
             return CalcResult::new_args_number_error(cell);
@@ -230,10 +231,19 @@ impl<'a> Model<'a> {
             }
         };
 
-        // DiscreteCDF::inverse_cdf returns u64 for binomial
-        let k = statrs::distribution::DiscreteCDF::inverse_cdf(&dist, alpha);
+        // Smallest k with CDF(k) >= alpha. statrs' generic `inverse_cdf` can panic
+        // (an unwrap inside its bisection), e.g. for BINOM.INV(1, 0.001, 0.1).
+        let (mut lo, mut hi) = (0u64, n);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if statrs::distribution::DiscreteCDF::cdf(&dist, mid) >= alpha {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
 
-        CalcResult::Number(k as f64)
+        CalcResult::Number(lo as f64)
     }
 
     pub(crate) fn fn_negbinom_dist(

@@ -43,9 +43,6 @@ type Position = {
   left: number;
 };
 
-// --palette-common-black
-const DEFAULT_BORDER_COLOR = "#272525";
-
 const BORDER_BUTTONS = [
   {
     value: BorderType.All,
@@ -123,7 +120,7 @@ export default function BorderPicker({
 
   const [position, setPosition] = useState<Position | null>(null);
   const [borderSelected, setBorderSelected] = useState<BorderType | null>(null);
-  const [borderColor, setBorderColor] = useState<Color>(DEFAULT_BORDER_COLOR);
+  const [borderColor, setBorderColor] = useState<Color>("");
   const [borderStyle, setBorderStyle] = useState(BorderStyle.Thin);
   const [colorPickerOpen, setColorPickerOpen] = useState(false);
   const [stylePickerOpen, setStylePickerOpen] = useState(false);
@@ -154,18 +151,6 @@ export default function BorderPicker({
       window.removeEventListener("scroll", updatePosition, true);
     };
   }, [anchorEl, open]);
-
-  useEffect(() => {
-    if (!borderSelected) {
-      return;
-    }
-
-    onChange({
-      color: borderColor,
-      style: borderStyle,
-      border: borderSelected,
-    });
-  }, [borderColor, borderStyle, borderSelected, onChange]);
 
   useEffect(() => {
     if (!open) {
@@ -202,7 +187,7 @@ export default function BorderPicker({
       return;
     }
     setBorderSelected(null);
-    setBorderColor(DEFAULT_BORDER_COLOR);
+    setBorderColor("");
     setBorderStyle(BorderStyle.Thin);
     setColorPickerOpen(false);
     setStylePickerOpen(false);
@@ -230,11 +215,23 @@ export default function BorderPicker({
     };
   }, [open, onClose, colorPickerOpen]);
 
+  const applyBorder = (
+    border: BorderType,
+    color: Color,
+    style: BorderStyle,
+  ): void => {
+    onChange({ color: color || undefined, style, border });
+  };
+
   const toggleBorder = (
     value: BorderType,
     offValue: BorderType | null,
   ): void => {
-    setBorderSelected((current) => (current === value ? offValue : value));
+    const next = borderSelected === value ? offValue : value;
+    setBorderSelected(next);
+    if (next !== null) {
+      applyBorder(next, borderColor, borderStyle);
+    }
   };
 
   if (!open || !anchorEl.current) {
@@ -283,6 +280,7 @@ export default function BorderPicker({
                 onClick={() => {
                   if (value === BorderType.None) {
                     setBorderSelected(BorderType.None);
+                    applyBorder(BorderType.None, borderColor, borderStyle);
                     return;
                   }
                   toggleBorder(value, button.offValue);
@@ -313,11 +311,15 @@ export default function BorderPicker({
           </button>
           <ColorPicker
             color={borderColor}
-            defaultColor={DEFAULT_BORDER_COLOR}
+            defaultColor=""
+            defaultSwatchColor="var(--palette-sheet-default-text-color)"
             title={t("color_picker.default")}
             onChange={(color) => {
               setBorderColor(color);
               setColorPickerOpen(false);
+              if (borderSelected) {
+                applyBorder(borderSelected, color, borderStyle);
+              }
             }}
             onClose={() => {
               setColorPickerOpen(false);
@@ -346,6 +348,9 @@ export default function BorderPicker({
               onSelect={(style) => {
                 setBorderStyle(style);
                 setStylePickerOpen(false);
+                if (borderSelected) {
+                  applyBorder(borderSelected, borderColor, style);
+                }
               }}
             />
           )}

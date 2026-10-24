@@ -1,7 +1,5 @@
 #![allow(clippy::unwrap_used)]
 
-use std::collections::HashMap;
-
 use crate::{
     constants::{LAST_COLUMN, LAST_ROW},
     test::util::new_empty_model,
@@ -55,7 +53,7 @@ fn set_the_range_does_not_set_the_cell() {
     assert_eq!(
         model.set_selected_range(5, 4, 10, 6),
         Err(
-            "The selected cell is not in one of the corners. Row: '1' and row range '(5, 10)'"
+            "The selected cell is not inside the range. Row: '1' and row range '(5, 10)'"
                 .to_string()
         )
     );
@@ -106,10 +104,10 @@ fn set_selected_cell_errors() {
 
 #[test]
 fn set_selected_cell_errors_wrong_sheet() {
-    let mut model = new_empty_model();
-    // forcefully set a wrong index
-    model.workbook.views.get_mut(&0).unwrap().sheet = 2;
+    let model = new_empty_model();
     let mut model = UserModel::from_model(model);
+    // forcefully set a wrong index
+    model.view.sheet = 2;
     // It's returning the wrong number
     assert_eq!(model.get_selected_sheet(), 2);
 
@@ -180,14 +178,52 @@ fn set_visible_cell_errors() {
 }
 
 #[test]
-fn errors_no_views() {
-    let mut model = new_empty_model();
-    // forcefully remove the view
-    model.workbook.views = HashMap::new();
-    // also in the sheet
-    model.workbook.worksheets[0].views = HashMap::new();
+fn new_sheets_start_at_a1() {
+    let model = new_empty_model();
     let mut model = UserModel::from_model(model);
-    // get methods will return defaults
+    model.set_selected_cell(5, 6).unwrap();
+    model.set_top_left_visible_cell(20, 10).unwrap();
+
+    // A new sheet has the default view
+    model.new_sheet().unwrap();
+    assert_eq!(model.get_selected_sheet(), 1);
+    assert_eq!(
+        model.get_selected_view(),
+        SelectedView {
+            sheet: 1,
+            row: 1,
+            column: 1,
+            range: [1, 1, 1, 1],
+            top_row: 1,
+            left_column: 1
+        }
+    );
+
+    // Each sheet keeps its own view
+    model.set_selected_sheet(0).unwrap();
+    assert_eq!(
+        model.get_selected_view(),
+        SelectedView {
+            sheet: 0,
+            row: 5,
+            column: 6,
+            range: [5, 6, 5, 6],
+            top_row: 20,
+            left_column: 10
+        }
+    );
+}
+
+#[test]
+fn the_view_is_not_serialized() {
+    let model = new_empty_model();
+    let mut model = UserModel::from_model(model);
+    model.new_sheet().unwrap();
+    model.set_selected_cell(5, 6).unwrap();
+    model.set_top_left_visible_cell(20, 10).unwrap();
+
+    // Opening the workbook again starts at the first sheet, A1
+    let model = UserModel::from_bytes(&model.to_bytes(), "en").unwrap();
     assert_eq!(model.get_selected_sheet(), 0);
     assert_eq!(model.get_selected_cell(), (0, 1, 1));
     assert_eq!(
@@ -201,9 +237,25 @@ fn errors_no_views() {
             left_column: 1
         }
     );
+}
 
-    // set methods won't complain. but won't work either
-    model.set_selected_sheet(0).unwrap();
-    model.set_selected_cell(5, 6).unwrap();
-    assert_eq!(model.get_selected_cell(), (0, 1, 1));
+#[test]
+fn scroll_offsets_sum_rounded_sizes() {
+    let model = new_empty_model();
+    let mut model = UserModel::from_model(model);
+    // The UI renders every row and column at a whole number of pixels
+    // (rounding each size), so the scroll offsets must be the sum of the
+    // individually rounded sizes — not the rounded sum of the raw sizes.
+    // These sizes are chosen so the two disagree:
+    //   heights: round(20.4) + round(15.4) = 35, but round(20.4 + 15.4) = 36
+    //   widths: round(80.6) + round(90.6) = 172, but round(80.6 + 90.6) = 171
+    model.set_rows_height(0, 1, 1, 20.4).unwrap();
+    model.set_rows_height(0, 2, 2, 15.4).unwrap();
+    model.set_columns_width(0, 1, 1, 80.6).unwrap();
+    model.set_columns_width(0, 2, 2, 90.6).unwrap();
+
+    model.set_top_left_visible_cell(3, 3).unwrap();
+
+    assert_eq!(model.get_scroll_y(), Ok(35.0));
+    assert_eq!(model.get_scroll_x(), Ok(172.0));
 }

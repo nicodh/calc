@@ -9,12 +9,11 @@ import {
   useRef,
   useState,
 } from "react";
-import { createPortal } from "react-dom";
-
+import { createAnchoredPortal } from "../createAnchoredPortal";
 import "./menu.css";
+import { useMenuPosition } from "../utils/useMenuPosition";
 import { useAnchorPosition } from "./useAnchorPosition";
 import { useMenuKeyDown } from "./useMenuKeyDown";
-import { useMenuPosition } from "./useMenuPosition";
 
 const focusableSelector =
   'a[href],button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])';
@@ -44,9 +43,14 @@ export type MenuProperties = MenuTriggerProperties | MenuControlledProperties;
 
 export function Menu(props: MenuProperties) {
   const isTriggerMode = props.trigger !== undefined;
+  const [portalAnchor, setPortalAnchor] = useState<HTMLSpanElement | null>(
+    null,
+  );
 
   const [uncontrolledOpen, setUncontrolledOpen] = useState(false);
-  const open = isTriggerMode ? uncontrolledOpen : props.open;
+  const requestedOpen = isTriggerMode ? uncontrolledOpen : props.open;
+  // Won't open until the portal target resolves to avoid menu mispositioning.
+  const open = requestedOpen && portalAnchor !== null;
 
   const triggerPosition = useMenuPosition(isTriggerMode ? open : false);
   const anchorPosition = useAnchorPosition(
@@ -122,7 +126,7 @@ export function Menu(props: MenuProperties) {
   }, [open, menuRef]);
 
   const menu = open
-    ? createPortal(
+    ? createAnchoredPortal(
         <div
           ref={menuRef}
           role="presentation"
@@ -133,36 +137,37 @@ export function Menu(props: MenuProperties) {
             {props.children}
           </div>
         </div>,
-        document.body,
+        portalAnchor,
       )
     : null;
 
   if (!isTriggerMode) {
     return (
       <MenuContext.Provider value={{ close, activeSetOpenRef }}>
+        <span ref={setPortalAnchor} hidden />
         {menu}
       </MenuContext.Provider>
     );
   }
 
-  const clonedTrigger = cloneElement(
-    props.trigger as ReactElement<Record<string, unknown>>,
-    {
-      ref: triggerPosition.triggerRef,
-      onClick: (e: React.MouseEvent) => {
-        (
-          props.trigger?.props as { onClick?: React.MouseEventHandler }
-        ).onClick?.(e);
-        setUncontrolledOpen((current) => !current);
-      },
-      "aria-haspopup": "menu",
-      "aria-expanded": open ? "true" : "false",
+  const trigger = props.trigger as ReactElement<Record<string, unknown>>;
+  const triggerOnClick = trigger.props.onClick as
+    | React.MouseEventHandler
+    | undefined;
+  const clonedTrigger = cloneElement(trigger, {
+    ref: triggerPosition.triggerRef,
+    onClick: (e: React.MouseEvent) => {
+      triggerOnClick?.(e);
+      setUncontrolledOpen((current) => !current);
     },
-  );
+    "aria-haspopup": "menu",
+    "aria-expanded": open ? "true" : "false",
+  });
 
   return (
     <MenuContext.Provider value={{ close, activeSetOpenRef }}>
       {clonedTrigger}
+      <span ref={setPortalAnchor} hidden />
       {menu}
     </MenuContext.Provider>
   );

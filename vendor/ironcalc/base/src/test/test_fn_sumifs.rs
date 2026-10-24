@@ -1,7 +1,9 @@
 #![allow(clippy::unwrap_used)]
 
+#[cfg(not(feature = "collab-test"))]
 use crate::model::Model;
 use crate::test::util::new_empty_model;
+use crate::test::util::TestModel;
 
 #[test]
 fn test_fn_sumifs_arguments() {
@@ -52,7 +54,7 @@ fn test_fn_sumifs_arguments() {
 //   C2..C8  = 1..7         (matches "<7/31/2023")
 //   C9      = 100          (matches "7/31/2023")
 //   C10..C11= 99, 50       (matches ">7/31/2023")
-fn populate_date_apply_ifs_data(model: &mut Model) {
+fn populate_date_apply_ifs_data(model: &mut TestModel) {
     let date_serials = [45131, 45132, 45133, 45134, 45135, 45136, 45137];
     let values = [1, 2, 3, 4, 5, 6, 7];
     for (idx, (serial, value)) in date_serials.iter().zip(values.iter()).enumerate() {
@@ -106,6 +108,7 @@ fn test_apply_ifs_date_criterion_covers_all_consumers() {
     assert_eq!(model._get_text("A9"), *"50");
 }
 
+#[cfg(not(feature = "collab-test"))]
 #[test]
 fn test_apply_ifs_date_criterion_respects_locale() {
     // Build the same workbook under en-GB (D/M/Y). "31/7/2023" is only a
@@ -126,4 +129,27 @@ fn test_apply_ifs_date_criterion_respects_locale() {
     assert_eq!(model._get_text("A2"), *"4");
     assert_eq!(model._get_text("A3"), *"7");
     assert_eq!(model._get_text("A4"), *"1");
+}
+
+// ── whole-column range and a spill beyond the used area ─────────────────────
+
+// A whole-column range is clipped to the sheet's used area before it is
+// walked. Inside an anchor, the column may be spilled on demand during the
+// walk, past the bound the walk was clipped to. The skipped part is on
+// record, so the spill restarts the pass and the second run sees it all.
+#[test]
+fn test_fn_sumifs_whole_column_sees_a_spill_beyond_the_used_area() {
+    let cases = [
+        ("SUMIF(D:D,\">2\")", "12"),
+        ("SUMIFS(D:D,D:D,\">2\")", "12"),
+    ];
+    for (formula, expected) in cases {
+        let mut model = new_empty_model();
+        model._set("A1", &format!("=SEQUENCE(1,1,{formula})"));
+        model._set("C1", "=SEQUENCE(3,1,10)");
+        model._set("D1", "=SEQUENCE(5)");
+        model.evaluate();
+        assert_eq!(model._get_text("A1"), expected, "{formula}");
+        assert_eq!(model.evaluation.restarts_in_last_evaluation, 1, "{formula}");
+    }
 }

@@ -5,12 +5,21 @@ import {
   MenuItem,
   MenuItemWithSubmenu,
 } from "@ironcalc/workbook";
-import { FileDown, FileUp, Globe, Plus, Table2, Trash2 } from "lucide-react";
+import {
+  FileDown,
+  FileUp,
+  Globe,
+  Plus,
+  Sun,
+  Table2,
+  Trash2,
+} from "lucide-react";
 import { useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import DeleteWorkbookDialog from "../DeleteWorkbookDialog";
-import { getModelsMetadata, getSelectedUuid } from "../storage";
+import type { ThemeMode } from "../storage";
 import UploadFileDialog from "../UploadFileDialog/UploadFileDialog";
+import { useModelsMetadata, useSelectedUuid } from "../useStorage";
 
 const LANGUAGES = [
   ["en-US", "English"],
@@ -21,13 +30,21 @@ const LANGUAGES = [
   ["it-IT", "Italiano"],
 ] as const;
 
+const THEMES: [ThemeMode, string][] = [
+  ["light", "file_bar.file_menu.appearance_light"],
+  ["dark", "file_bar.file_menu.appearance_dark"],
+];
+
 export function FileMenu(props: {
   newModel: () => void;
   newModelFromTemplate: () => void;
   onDownload: () => void;
   onModelUpload: (blob: ArrayBuffer, fileName: string) => Promise<void>;
   onDelete: () => void;
+  isReadOnly: boolean;
   onLanguageChange: (language: string) => void;
+  themeMode: ThemeMode;
+  onThemeModeChange: (mode: ThemeMode) => void;
   isOpen: boolean;
   onOpen: () => void;
   onClose: () => void;
@@ -38,8 +55,8 @@ export function FileMenu(props: {
   const [anchorPosition, setAnchorPosition] = useState({ x: 0, y: 0 });
   const triggerRef = useRef<HTMLButtonElement>(null);
   const { t, i18n } = useTranslation();
-  const models = getModelsMetadata();
-  const selectedUuid = getSelectedUuid();
+  const models = useModelsMetadata();
+  const selectedUuid = useSelectedUuid();
 
   const captureAnchor = () => {
     const rect = triggerRef.current?.getBoundingClientRect();
@@ -91,6 +108,7 @@ export function FileMenu(props: {
         </MenuItem>
         <MenuItem
           destructive
+          disabled={props.isReadOnly}
           icon={<Trash2 />}
           onClick={() => setDeleteDialogOpen(true)}
         >
@@ -114,6 +132,20 @@ export function FileMenu(props: {
           ))}
         >
           {t("file_bar.file_menu.default_language")}
+        </MenuItemWithSubmenu>
+        <MenuItemWithSubmenu
+          icon={<Sun />}
+          submenu={THEMES.map(([mode, labelKey]) => (
+            <MenuItem
+              key={labelKey}
+              checked={props.themeMode === mode}
+              onClick={() => props.onThemeModeChange(mode)}
+            >
+              {t(labelKey)}
+            </MenuItem>
+          ))}
+        >
+          {t("file_bar.file_menu.appearance")}
         </MenuItemWithSubmenu>
       </Menu>
 

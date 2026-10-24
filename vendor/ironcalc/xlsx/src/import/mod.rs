@@ -1,12 +1,14 @@
 mod conditional_formatting;
 mod metadata;
 pub(crate) mod shared_strings;
+mod sheet_data;
 mod styles;
 mod tables;
 mod theme;
 mod util;
 mod workbook;
 mod worksheets;
+mod xml;
 
 use std::{
     collections::HashMap,
@@ -14,20 +16,20 @@ use std::{
     io::{BufReader, Cursor, Read},
 };
 
-use roxmltree::Node;
+use xml::XmlNode;
 
 use ironcalc_base::{
     expressions::{
         parser::{new_parser_english, stringify::to_english_string},
         types::CellReferenceRC,
     },
-    types::{Metadata, Workbook, WorkbookSettings, WorkbookView},
+    types::{Metadata, Workbook, WorkbookSettings},
     Model,
 };
 
 use crate::error::XlsxError;
 
-use shared_strings::read_shared_strings;
+use shared_strings::{read_shared_strings, SharedStringTable};
 
 use metadata::load_metadata;
 use styles::load_styles;
@@ -38,21 +40,19 @@ use worksheets::{load_sheets, Relationship};
 fn load_relationships<R: Read + std::io::Seek>(
     archive: &mut zip::ZipArchive<R>,
 ) -> Result<HashMap<String, Relationship>, XlsxError> {
-    let mut file = archive.by_name("xl/_rels/workbook.xml.rels")?;
-    let mut text = String::new();
-    file.read_to_string(&mut text)?;
-    let doc = roxmltree::Document::parse(&text)?;
-    let nodes: Vec<Node> = doc
+    let file = archive.by_name("xl/_rels/workbook.xml.rels")?;
+    let doc = XmlNode::parse(BufReader::new(file))?;
+    let nodes: Vec<&XmlNode> = doc
         .descendants()
         .filter(|n| n.has_tag_name("Relationship"))
         .collect();
     let mut rels = HashMap::new();
     for node in nodes {
         rels.insert(
-            get_attribute(&node, "Id")?.to_string(),
+            get_attribute(node, "Id")?.to_string(),
             Relationship {
-                rel_type: get_attribute(&node, "Type")?.to_string(),
-                target: get_attribute(&node, "Target")?.to_string(),
+                rel_type: get_attribute(node, "Type")?.to_string(),
+                target: get_attribute(node, "Target")?.to_string(),
             },
         );
     }
@@ -96,21 +96,25 @@ fn load_xlsx_from_reader<R: Read + std::io::Seek>(
 ) -> Result<Workbook, XlsxError> {
     let mut archive = zip::ZipArchive::new(reader)?;
 
-    let mut shared_strings = read_shared_strings(&mut archive)?;
+    let mut shared_strings = SharedStringTable::new(read_shared_strings(&mut archive)?);
     let mut workbook = load_workbook(&mut archive)?;
     let rels = load_relationships(&mut archive)?;
     let theme_path = resolve_theme_path(&rels);
     let theme = theme::load(&mut archive, theme_path.as_deref());
     let mut tables = HashMap::new();
-    let (worksheets, selected_sheet) = load_sheets(
+    // Styles must be loaded before the worksheets: conditional-formatting rules
+    // stored in x14 `extLst` extensions carry inline `<x14:dxf>` formats that we
+    // append to `styles.dxfs`, referencing them back by index from the rule.
+    let mut styles = load_styles(&mut archive, &theme)?;
+    let worksheets = load_sheets(
         &mut archive,
         &rels,
         &workbook,
         &mut tables,
         &mut shared_strings,
         &theme,
+        &mut styles.dxfs,
     )?;
-    let styles = load_styles(&mut archive, &theme)?;
     // reparse formulas in defined names, since they may refer to sheets and tables that have been loaded
     let worksheet_names = worksheets
         .iter()
@@ -133,17 +137,8 @@ fn load_xlsx_from_reader<R: Read + std::io::Seek>(
             }
         }
     };
-    let mut views = HashMap::new();
-    views.insert(
-        0,
-        WorkbookView {
-            sheet: selected_sheet,
-            window_width: 800,
-            window_height: 600,
-        },
-    );
     Ok(Workbook {
-        shared_strings,
+        shared_strings: shared_strings.into_strings(),
         defined_names: workbook.defined_names,
         worksheets,
         styles,
@@ -154,8 +149,8 @@ fn load_xlsx_from_reader<R: Read + std::io::Seek>(
         },
         metadata,
         tables,
-        views,
         theme,
+        meta: Default::default(),
     })
 }
 
@@ -203,4 +198,17 @@ pub fn load_from_icalc<'a>(file_name: &str, language_id: &'a str) -> Result<Mode
     let workbook: Workbook = bitcode::decode(&contents)
         .map_err(|e| XlsxError::IO(format!("Failed to decode file: {e}")))?;
     Model::from_workbook(workbook, language_id).map_err(XlsxError::Workbook)
+}
+
+#[cfg(test)]
+mod zip_input_tests {
+    use super::{load_from_xlsx_bytes, XlsxError};
+
+    #[test]
+    fn malformed_zip_inputs_remain_zip_errors() {
+        for bytes in [b"".as_slice(), b"not a ZIP archive", b"PK\x03\x04"] {
+            let result = load_from_xlsx_bytes(bytes, "invalid", "en", "UTC");
+            assert!(matches!(result, Err(XlsxError::Zip(_))));
+        }
+    }
 }
