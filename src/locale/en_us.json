@@ -130,5 +130,14 @@
   },
   "loading_screen": {
     "message": "Loading IronCalc"
+  },
+  "export": {
+    "send_as_xlsx": "Send as .xlsx",
+    "failed": "Could not export this workbook as .xlsx."
+  },
+  "import": {
+    "replace": "Replace workbook with .xlsx",
+    "replace_warning": "This workbook already has changes. Importing replaces it for everyone in this chat, and those changes are lost. Send it as .xlsx first to keep a copy.\n\nReplace the workbook?",
+    "failed": "Could not read this file as a spreadsheet."
   }
 }

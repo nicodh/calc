@@ -130,5 +130,14 @@
   },
   "loading_screen": {
     "message": "IronCalc wird geladen"
+  },
+  "export": {
+    "send_as_xlsx": "Als .xlsx senden",
+    "failed": "Diese Arbeitsmappe konnte nicht als .xlsx exportiert werden."
+  },
+  "import": {
+    "replace": "Arbeitsmappe durch .xlsx ersetzen",
+    "replace_warning": "Diese Arbeitsmappe hat bereits Änderungen. Der Import ersetzt sie für alle in diesem Chat, und diese Änderungen gehen verloren. Sende sie vorher als .xlsx, um eine Kopie zu behalten.\n\nArbeitsmappe ersetzen?",
+    "failed": "Diese Datei konnte nicht als Tabelle gelesen werden."
   }
 }

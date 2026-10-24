@@ -21,18 +21,33 @@
 // workbook turns out not to be the earliest restores the earlier snapshot and
 // replays every diff it has sent or applied since its own base. To be able to
 // do that it keeps a journal of them.
+//
+// Importing an xlsx file replaces the shared workbook, which is the opposite
+// case: the imported workbook is newer and has to win anyway. Workbooks
+// therefore come in generations (`epoch`). An import publishes a snapshot one
+// generation up; a higher generation replaces a lower one outright, without
+// replaying anything, since those edits belong to the replaced workbook. Every
+// diff names the generation it was made in: one from an older generation is
+// ignored, one from a newer generation waits until that generation's snapshot
+// has arrived. Within a generation, the earliest workbook wins as above.
 
 export type Phase = "provisional" | "established";
 
-// Which workbook a device's state descends from: when it was created, and by
-// which session. Ordered by creation time, then session, the same on every
-// device.
-export type Base = { createdAt: number; session: number };
+// Which workbook a device's state descends from: its generation, when it was
+// created and by which session, and whether it came from a file. Ordered by
+// generation, then creation time, then session, the same on every device.
+export type Base = {
+  epoch: number;
+  createdAt: number;
+  session: number;
+  imported?: boolean;
+};
 
 const PHASE_KEY = "bootstrap_phase";
 const CREATED_KEY = "bootstrap_created";
 const BASE_KEY = "bootstrap_base";
 const JOURNAL_KEY = "bootstrap_journal";
+const HELD_KEY = "bootstrap_held";
 
 export function getPhase(): Phase {
   return localStorage.getItem(PHASE_KEY) === "provisional"
@@ -55,7 +70,8 @@ export function getBase(): Base | null {
   try {
     const base = JSON.parse(localStorage.getItem(BASE_KEY) ?? "null");
     if (base && typeof base.createdAt === "number" && typeof base.session === "number") {
-      return base;
+      // A base stored before generations existed is of the first one.
+      return { epoch: 0, ...base };
     }
   } catch {
     // An unreadable base is treated as unknown.
@@ -79,8 +95,13 @@ export function rebaseOnto(base: Base) {
   localStorage.setItem(BASE_KEY, JSON.stringify(base));
 }
 
-// Whether `a` was created before `b`, by the order every device agrees on.
-// An unknown base loses to any known one.
+// The generation of a base; an unknown one counts as the first.
+export function epochOf(base: Base | null): number {
+  return base?.epoch ?? 0;
+}
+
+// Whether `a` was created before `b` within one generation, by the order every
+// device agrees on. An unknown base loses to any known one.
 export function isEarlier(a: Base | null, b: Base | null): boolean {
   if (!a) {
     return false;
@@ -113,4 +134,28 @@ export function journalAppend(data: string): boolean {
     console.error("[calc] the diff journal no longer fits into storage", error);
     return false;
   }
+}
+
+// Whether the workbook holds anything that replacing it would lose: some diff
+// has been sent or applied since its base, or the base itself came from a file.
+export function hasChanges(): boolean {
+  return journalEntries().length > 0 || getBase()?.imported === true;
+}
+
+// Diffs of a newer generation than ours, waiting for that generation's
+// snapshot. They are kept in storage: later updates get acknowledged past
+// them, so a restart would not replay them.
+export type Held = { data: string; epoch: number };
+
+export function heldEntries(): Held[] {
+  try {
+    const entries = JSON.parse(localStorage.getItem(HELD_KEY) ?? "[]");
+    return Array.isArray(entries) ? entries : [];
+  } catch {
+    return [];
+  }
+}
+
+export function setHeld(entries: Held[]) {
+  localStorage.setItem(HELD_KEY, JSON.stringify(entries));
 }
