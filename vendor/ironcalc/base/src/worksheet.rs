@@ -1,10 +1,10 @@
+use std::borrow::Cow;
+
 use crate::constants::{self, LAST_COLUMN, LAST_ROW};
 use crate::expressions::types::CellReferenceIndex;
 use crate::expressions::utils::{is_valid_column_number, is_valid_row};
 use crate::model::CellStructure;
 use crate::{expressions::token::Error, types::*};
-
-use std::collections::HashMap;
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct WorksheetDimension {
@@ -22,7 +22,9 @@ pub enum NavigationDirection {
     Down,
 }
 
-impl Worksheet {
+/// The storage seam the evaluation engine reads and writes cells through: every ordinal it names a
+/// cell by is resolved against the sheet's `index` before it touches `sheet_data`.
+impl<A: Position> Worksheet<A> {
     pub fn get_name(&self) -> String {
         self.name.clone()
     }
@@ -31,16 +33,51 @@ impl Worksheet {
         self.sheet_id
     }
 
-    pub fn set_name(&mut self, name: &str) {
-        self.name = name.to_string();
+    /// The ordinal rectangle `(row1, column1, row2, column2)` of the merged range that covers
+    /// `(row, column)`, if any.
+    pub fn merged_range_containing(&self, row: i32, column: i32) -> Option<(i32, i32, i32, i32)> {
+        self.merged_cells.iter().find_map(|m| {
+            let rect = A::resolve_merged(m, &self.index)?;
+            let (row1, column1, row2, column2) = rect;
+            ((row1..=row2).contains(&row) && (column1..=column2).contains(&column)).then_some(rect)
+        })
     }
 
-    pub fn cell(&self, row: i32, column: i32) -> Option<&Cell> {
-        self.sheet_data.get(&row)?.get(&column)
+    /// The ordinal rectangles `(row1, column1, row2, column2)` of every merged range the index
+    /// currently resolves.
+    pub fn merged_ranges(&self) -> impl Iterator<Item = (i32, i32, i32, i32)> + '_ {
+        self.merged_cells
+            .iter()
+            .filter_map(|m| A::resolve_merged(m, &self.index))
+    }
+
+    /// The anchor (top-left cell) of the merged range containing `(row, column)`, or the cell
+    /// itself when it is not merged.
+    pub fn merge_anchor(&self, row: i32, column: i32) -> (i32, i32) {
+        match self.merged_range_containing(row, column) {
+            Some((first_row, first_column, _, _)) => (first_row, first_column),
+            None => (row, column),
+        }
+    }
+
+    /// The cell at a position, if there is one. It is borrowed from the sheet
+    /// if the sheet holds it as a cell, and made for the occasion if it holds
+    /// it as a number (see `SheetData`): either way it reads as a `&Cell`.
+    pub fn cell(&self, row: i32, column: i32) -> Option<Cow<'_, Cell>> {
+        A::cell(self, row, column)
+    }
+
+    pub(crate) fn stored_cell(&self, row: i32, column: i32) -> Option<Cow<'_, Cell>> {
+        A::stored_cell(self, row, column)
+    }
+
+    #[inline]
+    pub(crate) fn write_spill(&mut self, row: i32, column: i32, cell: Cell) -> Result<(), String> {
+        A::write_spill(self, row, column, cell)
     }
 
     pub(crate) fn cell_mut(&mut self, row: i32, column: i32) -> Option<&mut Cell> {
-        self.sheet_data.get_mut(&row)?.get_mut(&column)
+        A::stored_cell_mut(self, row, column)
     }
 
     pub(crate) fn update_cell(
@@ -53,30 +90,45 @@ impl Worksheet {
         if !is_valid_row(row) || !is_valid_column_number(column) {
             return Err("Incorrect row or column".to_string());
         }
+        A::store_cell(self, row, column, new_cell)
+    }
 
-        match self.sheet_data.get_mut(&row) {
-            Some(column_data) => match column_data.get(&column) {
-                Some(_cell) => {
-                    column_data.insert(column, new_cell);
-                }
-                None => {
-                    column_data.insert(column, new_cell);
-                }
-            },
-            None => {
-                let mut column_data = HashMap::new();
-                column_data.insert(column, new_cell);
-                self.sheet_data.insert(row, column_data);
-            }
-        }
-        Ok(())
+    /// Every stored cell as `(row, column, &Cell)`, in row-major ordinal order.
+    /// A key the index no longer addresses names no position, and is skipped.
+    pub(crate) fn cells(&self) -> impl Iterator<Item = (i32, i32, Cow<'_, Cell>)> {
+        A::stored_cells(self)
+    }
+
+    /// The cells of a row from `first_column` to `last_column`, both included.
+    pub(crate) fn cells_in_row_between(
+        &self,
+        row: i32,
+        first_column: i32,
+        last_column: i32,
+    ) -> impl Iterator<Item = (i32, Cow<'_, Cell>)> {
+        A::cells_in_row_between(self, row, first_column, last_column)
+    }
+
+    /// See [`Position::numbers_in_row_between`].
+    pub(crate) fn numbers_in_row_between(
+        &self,
+        row: i32,
+        first_column: i32,
+        last_column: i32,
+    ) -> Option<&[f64]> {
+        A::numbers_in_row_between(self, row, first_column, last_column)
+    }
+
+    /// [`Self::cells`], collected.
+    pub(crate) fn cells_in_order(&self) -> Vec<(i32, i32, Cow<'_, Cell>)> {
+        self.cells().collect()
     }
 
     // See: get_style_for_cell
     fn get_row_column_style(&self, row_index: i32, column_index: i32) -> i32 {
         let rows = &self.rows;
         for row in rows {
-            if row.r == row_index {
+            if A::row_ordinal(&self.index, &row.r) == Some(row_index) {
                 if row.custom_format {
                     return row.s;
                 }
@@ -85,8 +137,9 @@ impl Worksheet {
         }
         let cols = &self.cols;
         for column in cols.iter() {
-            let min = column.min;
-            let max = column.max;
+            let Some((min, max)) = self.col_span(column) else {
+                continue;
+            };
             if column_index >= min && column_index <= max {
                 return column.style.unwrap_or(0);
             }
@@ -94,14 +147,93 @@ impl Worksheet {
         0
     }
 
+    /// The 1-based ordinal interval a column record currently covers, or `None` if it collapsed.
+    fn col_span(&self, column: &Col<A>) -> Option<(i32, i32)> {
+        let span = RangeRef {
+            rows: None,
+            cols: Some((column.min.clone(), column.max.clone())),
+        };
+        let (_, min, _, max) = A::resolve_range(&span, &self.index)?;
+        Some((min, max))
+    }
+
     pub fn get_style(&self, row: i32, column: i32) -> i32 {
-        match self.sheet_data.get(&row) {
-            Some(column_data) => match column_data.get(&column) {
-                Some(cell) => cell.get_style(),
-                None => self.get_row_column_style(row, column),
-            },
+        match self.cell(row, column) {
+            Some(cell) => cell.get_style(),
             None => self.get_row_column_style(row, column),
         }
+    }
+
+    pub fn cell_clear_contents(&mut self, row: i32, column: i32) -> Result<(), String> {
+        let s = self.get_style(row, column);
+        let cell = Cell::EmptyCell { s };
+        self.update_cell(row, column, cell)
+    }
+
+    /// Calculates dimension of the sheet. This function isn't cheap to calculate.
+    pub fn dimension(&self) -> WorksheetDimension {
+        // FIXME: It's probably better to just track the size as operations happen.
+        let mut row_range: Option<(i32, i32)> = None;
+        let mut column_range: Option<(i32, i32)> = None;
+
+        for (row_index, column_index, cell) in self.cells() {
+            // CSE at the boundary max expand the dimensions
+            let (width, height) = match &*cell {
+                Cell::ArrayFormula { r, .. } => (r.0.max(1), r.1.max(1)),
+                _ => (1, 1),
+            };
+            let last_row = row_index + height - 1;
+            let last_column = column_index + width - 1;
+            row_range = if let Some((current_min, current_max)) = row_range {
+                Some((current_min.min(row_index), current_max.max(last_row)))
+            } else {
+                Some((row_index, last_row))
+            };
+            column_range = if let Some((current_min, current_max)) = column_range {
+                Some((current_min.min(column_index), current_max.max(last_column)))
+            } else {
+                Some((column_index, last_column))
+            };
+        }
+
+        let dimension = if let Some((min_row, max_row)) = row_range {
+            column_range.map(|(min_column, max_column)| WorksheetDimension {
+                min_row,
+                min_column,
+                max_row,
+                max_column,
+            })
+        } else {
+            None
+        };
+
+        dimension.unwrap_or(WorksheetDimension {
+            min_row: 1,
+            max_row: 1,
+            min_column: 1,
+            max_column: 1,
+        })
+    }
+
+    /// Returns true if cell is completely empty.
+    /// Cell with formula that evaluates to empty string is not considered empty.
+    pub fn is_empty_cell(&self, row: i32, column: i32) -> Result<bool, String> {
+        if !is_valid_column_number(column) || !is_valid_row(row) {
+            return Err("Row or column is outside valid range.".to_string());
+        }
+
+        let is_empty = match self.cell(row, column) {
+            Some(cell) => matches!(*cell, Cell::EmptyCell { .. }),
+            None => true,
+        };
+
+        Ok(is_empty)
+    }
+}
+
+impl Worksheet {
+    pub fn set_name(&mut self, name: &str) {
+        self.name = name.to_string();
     }
 
     pub fn set_style(&mut self, style_index: i32) -> Result<(), String> {
@@ -295,17 +427,6 @@ impl Worksheet {
         self.update_cell(row, column, cell)
     }
 
-    pub fn set_cell_with_number(
-        &mut self,
-        row: i32,
-        column: i32,
-        value: f64,
-        style: i32,
-    ) -> Result<(), String> {
-        let cell = Cell::new_number(value, style);
-        self.update_cell(row, column, cell)
-    }
-
     pub fn set_cell_with_string(
         &mut self,
         row: i32,
@@ -339,12 +460,6 @@ impl Worksheet {
         self.update_cell(row, column, cell)
     }
 
-    pub fn cell_clear_contents(&mut self, row: i32, column: i32) -> Result<(), String> {
-        let s = self.get_style(row, column);
-        let cell = Cell::EmptyCell { s };
-        self.update_cell(row, column, cell)
-    }
-
     pub fn cell_clear_contents_with_style(
         &mut self,
         row: i32,
@@ -353,6 +468,19 @@ impl Worksheet {
     ) -> Result<(), String> {
         let cell = Cell::EmptyCell { s: style };
         self.update_cell(row, column, cell)
+    }
+
+    /// Returns the merged cell containing (row, column), if any
+    pub fn merged_cell_containing(&self, row: i32, column: i32) -> Option<&MergedCell> {
+        self.merged_cells.iter().find(|m| m.contains(row, column))
+    }
+
+    /// Returns true if (row, column) is inside a merged range but is not its anchor
+    pub fn is_covered_cell(&self, row: i32, column: i32) -> bool {
+        match self.merged_cell_containing(row, column) {
+            Some(m) => m.row != row || m.column != column,
+            None => false,
+        }
     }
 
     pub fn set_frozen_rows(&mut self, frozen_rows: i32) -> Result<(), String> {
@@ -530,29 +658,6 @@ impl Worksheet {
         Ok(())
     }
 
-    /// Return the width of a column in pixels
-    pub fn get_column_width(&self, column: i32) -> Result<f64, String> {
-        if !is_valid_column_number(column) {
-            return Err(format!("Column number '{column}' is not valid."));
-        }
-
-        let cols = &self.cols;
-        for col in cols {
-            let min = col.min;
-            let max = col.max;
-            if column >= min && column <= max {
-                if col.hidden {
-                    return Ok(0.0);
-                }
-                if col.custom_width {
-                    return Ok(col.width * constants::COLUMN_WIDTH_FACTOR);
-                }
-                break;
-            }
-        }
-        Ok(constants::DEFAULT_COLUMN_WIDTH)
-    }
-
     /// Return the actual width of a column in pixels, ignoring hidden status
     pub fn get_actual_column_width(&self, column: i32) -> Result<f64, String> {
         if !is_valid_column_number(column) {
@@ -571,37 +676,6 @@ impl Worksheet {
             }
         }
         Ok(constants::DEFAULT_COLUMN_WIDTH)
-    }
-
-    /// Returns true if the column is hidden
-    pub fn is_column_hidden(&self, column: i32) -> Result<bool, String> {
-        if !is_valid_column_number(column) {
-            return Err(format!("Column number '{column}' is not valid."));
-        }
-
-        let cols = &self.cols;
-        for col in cols {
-            let min = col.min;
-            let max = col.max;
-            if column >= min && column <= max {
-                return Ok(col.hidden);
-            }
-        }
-        Ok(false)
-    }
-
-    /// Returns if a row is hidden
-    pub fn is_row_hidden(&self, row: i32) -> Result<bool, String> {
-        if !is_valid_row(row) {
-            return Err(format!("Row number '{row}' is not valid."));
-        }
-        let rows = &self.rows;
-        for r in rows {
-            if r.r == row {
-                return Ok(r.hidden);
-            }
-        }
-        Ok(false)
     }
 
     /// Returns the column style index if present
@@ -631,11 +705,11 @@ impl Worksheet {
             return Err(format!("Column number '{column}' is not valid."));
         }
 
-        for row in self.sheet_data.keys() {
-            if self.cell(*row, column).is_some() {
+        for row in self.sheet_data.rows() {
+            if self.cell(row, column).is_some() {
                 column_cell_references.push(CellReferenceIndex {
                     sheet: self.sheet_id,
-                    row: *row,
+                    row,
                     column,
                 });
             }
@@ -644,108 +718,46 @@ impl Worksheet {
     }
 
     pub(crate) fn remove_cell(&mut self, row: i32, column: i32) -> Result<(), String> {
-        if let Some(row_data) = self.sheet_data.get_mut(&row) {
-            row_data.remove(&column);
-            if row_data.is_empty() {
-                self.sheet_data.remove(&row);
-            }
-        }
+        self.sheet_data.remove_cell(row, column);
         Ok(())
+    }
+}
+
+impl<A: Position> Worksheet<A> {
+    /// Sets a number in a cell. The number has to be finite: no cell holds a
+    /// NaN or an infinity, and the cell is left as it was if given one.
+    pub fn set_cell_with_number(
+        &mut self,
+        row: i32,
+        column: i32,
+        value: f64,
+        style: i32,
+    ) -> Result<(), String> {
+        if !value.is_finite() {
+            return Err(format!("A cell cannot hold the number {value}"));
+        }
+        let cell = Cell::new_number(value, style);
+        self.update_cell(row, column, cell)
+    }
+
+    /// Return the width of a column in pixels
+    pub fn get_column_width(&self, column: i32) -> Result<f64, String> {
+        A::column_width(self, column)
+    }
+
+    /// Returns true if the column is hidden
+    pub fn is_column_hidden(&self, column: i32) -> Result<bool, String> {
+        A::is_column_hidden(self, column)
     }
 
     /// Returns the height of a row in pixels
     pub fn row_height(&self, row: i32) -> Result<f64, String> {
-        if !is_valid_row(row) {
-            return Err(format!("Row number '{row}' is not valid."));
-        }
-
-        let rows = &self.rows;
-        for r in rows {
-            if r.r == row {
-                if r.hidden {
-                    return Ok(0.0);
-                }
-                return Ok(r.height * constants::ROW_HEIGHT_FACTOR);
-            }
-        }
-        Ok(constants::DEFAULT_ROW_HEIGHT)
+        A::row_height(self, row)
     }
 
-    /// Calculates dimension of the sheet. This function isn't cheap to calculate.
-    pub fn dimension(&self) -> WorksheetDimension {
-        // FIXME: It's probably better to just track the size as operations happen.
-        if self.sheet_data.is_empty() {
-            return WorksheetDimension {
-                min_row: 1,
-                max_row: 1,
-                min_column: 1,
-                max_column: 1,
-            };
-        }
-
-        let mut row_range: Option<(i32, i32)> = None;
-        let mut column_range: Option<(i32, i32)> = None;
-
-        for (row_index, columns) in &self.sheet_data {
-            row_range = if let Some((current_min, current_max)) = row_range {
-                Some((current_min.min(*row_index), current_max.max(*row_index)))
-            } else {
-                Some((*row_index, *row_index))
-            };
-
-            for column_index in columns.keys() {
-                column_range = if let Some((current_min, current_max)) = column_range {
-                    Some((
-                        current_min.min(*column_index),
-                        current_max.max(*column_index),
-                    ))
-                } else {
-                    Some((*column_index, *column_index))
-                }
-            }
-        }
-
-        let dimension = if let Some((min_row, max_row)) = row_range {
-            if let Some((min_column, max_column)) = column_range {
-                Some(WorksheetDimension {
-                    min_row,
-                    min_column,
-                    max_row,
-                    max_column,
-                })
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        dimension.unwrap_or(WorksheetDimension {
-            min_row: 1,
-            max_row: 1,
-            min_column: 1,
-            max_column: 1,
-        })
-    }
-
-    /// Returns true if cell is completely empty.
-    /// Cell with formula that evaluates to empty string is not considered empty.
-    pub fn is_empty_cell(&self, row: i32, column: i32) -> Result<bool, String> {
-        if !is_valid_column_number(column) || !is_valid_row(row) {
-            return Err("Row or column is outside valid range.".to_string());
-        }
-
-        let is_empty = if let Some(data_row) = self.sheet_data.get(&row) {
-            if let Some(cell) = data_row.get(&column) {
-                matches!(cell, Cell::EmptyCell { .. })
-            } else {
-                true
-            }
-        } else {
-            true
-        };
-
-        Ok(is_empty)
+    /// Returns if a row is hidden
+    pub fn is_row_hidden(&self, row: i32) -> Result<bool, String> {
+        A::is_row_hidden(self, row)
     }
 
     // Returns:
@@ -764,7 +776,7 @@ impl Worksheet {
             Some(c) => c,
             None => return Err("Cell does not exist.".to_string()),
         };
-        match cell {
+        match &*cell {
             Cell::ArrayFormula { r, .. } => Ok((r.0, r.1)),
             Cell::CellFormula { .. } => Ok((1, 1)),
             _ => Err("Cell does not contain a formula.".to_string()),
@@ -785,7 +797,7 @@ impl Worksheet {
             Some(c) => c,
             None => return Ok(CellStructure::SingleCell),
         };
-        match cell {
+        match &*cell {
             Cell::ArrayFormula {
                 r,
                 kind: ArrayKind::Cse,
@@ -801,7 +813,7 @@ impl Worksheet {
                     Some(c) => c,
                     None => return Err("Invalid spill reference".to_string()),
                 };
-                match anchor_cell {
+                match &*anchor_cell {
                     Cell::ArrayFormula {
                         r,
                         kind: ArrayKind::Cse,
@@ -824,7 +836,6 @@ impl Worksheet {
             _ => Ok(CellStructure::SingleCell),
         }
     }
-
     /// It provides convenient method for user navigation in the spreadsheet by jumping to edges.
     /// Spreadsheet engines usually allow this method of navigation by using CTRL+arrows.
     /// Behaviour summary:
@@ -843,17 +854,34 @@ impl Worksheet {
             return Err("Row or column is outside valid range.".to_string());
         }
 
-        let start_cell = (row, column);
+        // A merged cell behaves as a single cell: stepping out of it starts at
+        // its far edge in the direction of travel.
+        let start_cell = match self.merged_range_containing(row, column) {
+            Some((first_row, first_column, last_row, last_column)) => match direction {
+                NavigationDirection::Left => (row, first_column),
+                NavigationDirection::Right => (row, last_column),
+                NavigationDirection::Up => (first_row, column),
+                NavigationDirection::Down => (last_row, column),
+            },
+            None => (row, column),
+        };
         let neighbour_cell = if let Some(cell) = step_in_direction(start_cell, direction) {
             cell
         } else {
             return Ok((start_cell.0, start_cell.1));
         };
 
-        if self.is_empty_cell(start_cell.0, start_cell.1)? {
+        // The content of a merged cell lives at the anchor: every cell of the
+        // range is as empty as the anchor is.
+        let is_empty_merge_aware = |row: i32, column: i32| -> Result<bool, String> {
+            let (anchor_row, anchor_column) = self.merge_anchor(row, column);
+            self.is_empty_cell(anchor_row, anchor_column)
+        };
+
+        if is_empty_merge_aware(start_cell.0, start_cell.1)? {
             // Find first non-empty cell or move to the end.
             let found_cells = walk_in_direction(start_cell, direction, |(row, column)| {
-                Ok(!self.is_empty_cell(row, column)?)
+                Ok(!is_empty_merge_aware(row, column)?)
             })?;
             Ok(match found_cells.found_cell {
                 Some(cell) => cell,
@@ -862,9 +890,9 @@ impl Worksheet {
         } else {
             // Neighbour cell is empty     => find FIRST that is NOT empty
             // Neighbour cell is not empty => find LAST  that is NOT empty in sequence
-            if self.is_empty_cell(neighbour_cell.0, neighbour_cell.1)? {
+            if is_empty_merge_aware(neighbour_cell.0, neighbour_cell.1)? {
                 let found_cells = walk_in_direction(start_cell, direction, |(row, column)| {
-                    Ok(!self.is_empty_cell(row, column)?)
+                    Ok(!is_empty_merge_aware(row, column)?)
                 })?;
                 Ok(match found_cells.found_cell {
                     Some(cell) => cell,
@@ -872,7 +900,7 @@ impl Worksheet {
                 })
             } else {
                 let found_cells = walk_in_direction(start_cell, direction, |(row, column)| {
-                    self.is_empty_cell(row, column)
+                    is_empty_merge_aware(row, column)
                 })?;
                 Ok(found_cells.previous_cell)
             }

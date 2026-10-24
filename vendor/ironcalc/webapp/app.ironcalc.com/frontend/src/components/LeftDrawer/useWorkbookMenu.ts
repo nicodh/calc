@@ -2,10 +2,10 @@ import { useEffect, useState } from "react";
 import { downloadModel } from "../rpc";
 import {
   duplicateModel,
-  getSelectedUuid,
-  selectModelFromStorage,
+  loadModelFromStorage,
   togglePinWorkbook,
 } from "../storage";
+import { useSelectedUuid } from "../useStorage";
 
 interface Options {
   setModel: (uuid: string) => void;
@@ -19,7 +19,7 @@ export function useWorkbookMenu({ setModel, onDelete }: Options) {
     null,
   );
 
-  const selectedUuid = getSelectedUuid();
+  const selectedUuid = useSelectedUuid();
 
   useEffect(() => {
     if (intendedSelection && selectedUuid === intendedSelection) {
@@ -53,7 +53,7 @@ export function useWorkbookMenu({ setModel, onDelete }: Options) {
 
   const handleDownload = async (uuid: string) => {
     try {
-      const model = selectModelFromStorage(uuid);
+      const model = await loadModelFromStorage(uuid);
       if (model) {
         await downloadModel(model.toBytes(), model.getName());
       }
@@ -63,12 +63,16 @@ export function useWorkbookMenu({ setModel, onDelete }: Options) {
   };
 
   const handlePinToggle = (uuid: string) => {
-    togglePinWorkbook(uuid);
+    togglePinWorkbook(uuid).catch((e) =>
+      console.error("Failed to toggle pin:", e),
+    );
     setIntendedSelection(null);
   };
 
   const handleDuplicate = (uuid: string) => {
-    duplicateModel(uuid);
+    duplicateModel(uuid).catch((e) =>
+      console.error("Failed to duplicate workbook:", e),
+    );
     setIntendedSelection(null);
   };
 

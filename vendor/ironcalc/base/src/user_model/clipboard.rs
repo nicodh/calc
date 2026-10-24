@@ -1,5 +1,6 @@
 #![deny(missing_docs)]
 
+use std::borrow::Cow;
 use std::{
     collections::{HashMap, HashSet},
     io::Cursor,
@@ -12,11 +13,14 @@ use crate::{
     cf_types::ConditionalFormatting,
     expressions::types::{Area, CellReferenceIndex},
     model::CellStructure,
-    types::{ArrayKind, Cell, Style},
+    types::{ArrayKind, Cell, Link, MergedCell, RangeRef, Style},
     UserModel,
 };
 
 use crate::user_model::history::Diff;
+
+const PARTIAL_MERGE_PASTE_ERROR: &str =
+    "Cannot paste: a merged cell partially overlaps the paste area";
 
 /// Data for the clipboard
 pub type ClipboardData = HashMap<i32, HashMap<i32, ClipboardCell>>;
@@ -28,6 +32,10 @@ pub struct ClipboardCell {
     text: String,
     is_spill: bool,
     style: Style,
+    // the link attached to the cell, if any (`default` keeps older clipboard
+    // payloads without the field deserializable)
+    #[serde(default)]
+    link: Option<Link>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -39,6 +47,90 @@ pub struct Clipboard {
 }
 
 impl<'a> UserModel<'a> {
+    // Applies the merge containment rule to a paste into `target_area`
+    // (whose top-left cell is the paste anchor). The paste footprint is the
+    // target rectangle plus `pasted_merges`, the translated merges of the
+    // copied area it will recreate — they can stick out of the target
+    // because the copied range is clamped to the sheet dimension while a
+    // merge always travels whole.
+    //
+    // * a merged cell fully contained in the footprint is removed — the
+    //   paste replaces it. The removal diff is pushed before the cell diffs
+    //   so a forward replay writes on unmerged cells; the merges the paste
+    //   creates get their own diff afterwards, so an undo unmerges them
+    //   first.
+    // * a single-cell paste into the anchor of a merged cell keeps the
+    //   merge (only the anchor is written);
+    // * any other overlap rejects the paste, before anything changed.
+    fn remove_merges_replaced_by_paste(
+        &mut self,
+        target_area: &Area,
+        pasted_merges: &[MergedCell],
+        diff_list: &mut Vec<Diff>,
+    ) -> Result<(), String> {
+        let sheet = target_area.sheet;
+        let old_merged_cells = self.model.get_merged_cells(sheet)?.to_vec();
+        let single_cell_target = target_area.width == 1 && target_area.height == 1;
+        let cell_in_footprint = |row: i32, column: i32| -> bool {
+            (row >= target_area.row
+                && row < target_area.row + target_area.height
+                && column >= target_area.column
+                && column < target_area.column + target_area.width)
+                || pasted_merges.iter().any(|p| {
+                    row >= p.row
+                        && row < p.row + p.height
+                        && column >= p.column
+                        && column < p.column + p.width
+                })
+        };
+        let mut merged_cells_after_removal = Vec::new();
+        let mut removed_any = false;
+        for m in &old_merged_cells {
+            let intersects_footprint = m.intersects(
+                target_area.row,
+                target_area.column,
+                target_area.width,
+                target_area.height,
+            ) || pasted_merges
+                .iter()
+                .any(|p| m.intersects(p.row, p.column, p.width, p.height));
+            if !intersects_footprint {
+                merged_cells_after_removal.push(*m);
+                continue;
+            }
+            let mut contained = true;
+            'cells: for row in m.row..m.row + m.height {
+                for column in m.column..m.column + m.width {
+                    if !cell_in_footprint(row, column) {
+                        contained = false;
+                        break 'cells;
+                    }
+                }
+            }
+            if contained {
+                // replaced by the paste
+                removed_any = true;
+            } else if single_cell_target
+                && (m.row, m.column) == (target_area.row, target_area.column)
+            {
+                // pasting a single cell into a merged cell writes its anchor
+                merged_cells_after_removal.push(*m);
+            } else {
+                return Err(PARTIAL_MERGE_PASTE_ERROR.to_string());
+            }
+        }
+        if removed_any {
+            self.model.workbook.worksheet_mut(sheet)?.merged_cells =
+                merged_cells_after_removal.clone();
+            diff_list.push(Diff::SetMergedCells {
+                sheet,
+                old_value: old_merged_cells,
+                new_value: merged_cells_after_removal,
+            });
+        }
+        Ok(())
+    }
+
     /// Returns a copy of the selected area
     pub fn copy_to_clipboard(&self) -> Result<Clipboard, String> {
         let selected_area = self.get_selected_view();
@@ -61,12 +153,14 @@ impl<'a> UserModel<'a> {
                     self.model.get_cell_structure(sheet, row, column)?,
                     CellStructure::SpillArray { .. } | CellStructure::SpillDynamic { .. }
                 );
+                let link = self.model.get_cell_link(sheet, row, column)?;
                 data_row.insert(
                     column,
                     ClipboardCell {
                         text: content,
                         is_spill,
                         style,
+                        link,
                     },
                 );
                 text_row.push(text);
@@ -103,7 +197,9 @@ impl<'a> UserModel<'a> {
         let (source_first_row, source_first_column, source_last_row, source_last_column) =
             source_range;
         let sheet = view.sheet;
-        let [selected_row, selected_column, _, _] = view.range;
+        // Paste is anchored at the selected cell (the range is normalized, so
+        // its start corner is not necessarily where the selection began)
+        let (selected_row, selected_column) = (view.row, view.column);
         let mut max_row = selected_row;
         let mut max_column = selected_column;
         let area = &Area {
@@ -120,6 +216,37 @@ impl<'a> UserModel<'a> {
             width: source_last_column - source_first_column + 1,
             height: source_last_row - source_first_row + 1,
         };
+
+        // The merges of the copied area, captured before the containment
+        // step below can remove target merges: when the paste overlaps its
+        // own source, a source merge can also be a replaced target merge and
+        // must still be recreated.
+        let source_merges: Vec<MergedCell> = self
+            .model
+            .get_merged_cells(source_sheet)?
+            .iter()
+            .filter(|m| {
+                m.intersects(
+                    source_first_row,
+                    source_first_column,
+                    source_last_column - source_first_column + 1,
+                    source_last_row - source_first_row + 1,
+                )
+            })
+            .copied()
+            .collect();
+
+        // Merged cells in the target are replaced by the paste (or reject it)
+        let pasted_merges: Vec<MergedCell> = source_merges
+            .iter()
+            .map(|m| MergedCell {
+                row: m.row + selected_row - source_first_row,
+                column: m.column + selected_column - source_first_column,
+                width: m.width,
+                height: m.height,
+            })
+            .collect();
+        self.remove_merges_replaced_by_paste(target_area, &pasted_merges, &mut diff_list)?;
 
         let mut seen_cells = HashSet::new();
         // Compute all changes
@@ -178,7 +305,7 @@ impl<'a> UserModel<'a> {
                     .workbook
                     .worksheet(sheet)?
                     .cell(target_row, target_column)
-                    .cloned();
+                    .map(Cow::into_owned);
 
                 let old_style =
                     self.model
@@ -194,6 +321,8 @@ impl<'a> UserModel<'a> {
                 seen_cells.insert((target_row, target_column));
             }
         }
+        // Clearing the target area also removes its links: capture them for undo
+        diff_list.extend(self.range_link_diffs(target_area)?);
         // clear the whole area (this resets array formulas)
         self.model.range_clear_contents(target_area)?;
         // set the new values and styles
@@ -220,7 +349,91 @@ impl<'a> UserModel<'a> {
                 new_value: Box::new(style),
             });
         }
+        // Paste the links of the copied cells. This runs after the values are
+        // set so that it also overrides any link auto-created by an URL value.
+        for (source_row, data_row) in clipboard {
+            let target_row = selected_row + (source_row - source_first_row);
+            for (source_column, value) in data_row {
+                let target_column = selected_column + (source_column - source_first_column);
+                let old_link = self.model.get_cell_link(sheet, target_row, target_column)?;
+                if old_link == value.link {
+                    continue;
+                }
+                match &value.link {
+                    Some(link) => {
+                        self.model
+                            .set_cell_link(sheet, target_row, target_column, link.clone())?
+                    }
+                    None => self
+                        .model
+                        .delete_cell_link(sheet, target_row, target_column)?,
+                }
+                diff_list.push(Diff::SetCellLink {
+                    sheet,
+                    row: target_row,
+                    column: target_column,
+                    old_value: Box::new(old_link),
+                    new_value: Box::new(value.link.clone()),
+                });
+            }
+        }
         if is_cut {
+            // A cut moves the merged cells of the source area to the target:
+            // they are removed from the source and recreated, translated by
+            // the paste offset. A merge is matched by intersection: it can
+            // stick out of the cut range when its covered cells are empty (the
+            // copied range is clamped to the sheet dimension), and it moves
+            // whole.
+            let old_source_merged_cells = self.model.get_merged_cells(source_sheet)?.to_vec();
+            let old_target_merged_cells = self.model.get_merged_cells(sheet)?.to_vec();
+            self.model.unmerge_cells(&Area {
+                sheet: source_sheet,
+                row: source_first_row,
+                column: source_first_column,
+                width: source_last_column - source_first_column + 1,
+                height: source_last_row - source_first_row + 1,
+            })?;
+            for m in source_merges {
+                let merge_area = Area {
+                    sheet,
+                    row: m.row + selected_row - source_first_row,
+                    column: m.column + selected_column - source_first_column,
+                    width: m.width,
+                    height: m.height,
+                };
+                // Capture the content and links the merge will clear: a merge
+                // sticking out of the pasted block can swallow cells that were
+                // not part of the paste
+                let mut merge_diffs = self.covered_cells_clear_diffs(&merge_area)?;
+                // A translated merge can conflict outside the checked target
+                // area (another merge, an array formula) or fall off the
+                // sheet: those are dropped, the rest of the cut still lands
+                // merge_cells_keep_styles: the pasted cells already carry the
+                // merged style pattern of the source; stamping the anchor's
+                // style would drop the perimeter borders of non-anchor cells
+                if self.model.merge_cells_keep_styles(&merge_area).is_ok() {
+                    diff_list.append(&mut merge_diffs);
+                }
+            }
+            // One snapshot per touched sheet (source and target coincide on a
+            // same-sheet cut)
+            let mut snapshot_sheets = vec![source_sheet];
+            if sheet != source_sheet {
+                snapshot_sheets.push(sheet);
+            }
+            for (snapshot_sheet, old_value) in snapshot_sheets
+                .into_iter()
+                .zip([old_source_merged_cells, old_target_merged_cells])
+            {
+                let new_value = self.model.get_merged_cells(snapshot_sheet)?.to_vec();
+                if old_value != new_value {
+                    diff_list.push(Diff::SetMergedCells {
+                        sheet: snapshot_sheet,
+                        old_value,
+                        new_value,
+                    });
+                }
+            }
             for row in source_first_row..=source_last_row {
                 for column in source_first_column..=source_last_column {
                     if (source_sheet == sheet) && seen_cells.contains(&(row, column)) {
@@ -231,7 +444,7 @@ impl<'a> UserModel<'a> {
                         .workbook
                         .worksheet(source_sheet)?
                         .cell(row, column)
-                        .cloned();
+                        .map(Cow::into_owned);
 
                     diff_list.push(Diff::RangeClearContents {
                         sheet: source_sheet,
@@ -241,6 +454,19 @@ impl<'a> UserModel<'a> {
                         height: 1,
                         old_value: vec![vec![old_value.clone()]],
                     });
+
+                    // a cut also moves the link away from the source cell
+                    let old_link = self.model.get_cell_link(source_sheet, row, column)?;
+                    if let Some(old_link) = old_link {
+                        self.model.delete_cell_link(source_sheet, row, column)?;
+                        diff_list.push(Diff::SetCellLink {
+                            sheet: source_sheet,
+                            row,
+                            column,
+                            old_value: Box::new(Some(old_link)),
+                            new_value: Box::new(None),
+                        });
+                    }
 
                     // If the source is a dynamic formula anchor, range_clear_contents
                     // would erase its entire spill — including cells that were just
@@ -309,7 +535,7 @@ impl<'a> UserModel<'a> {
                     .workbook
                     .worksheet(ext_sheet)?
                     .cell(ext_row, ext_col)
-                    .cloned();
+                    .map(Cow::into_owned);
                 self.model
                     .set_user_input(ext_sheet, ext_row, ext_col, new_formula.clone())?;
                 diff_list.push(Diff::SetCellValue {
@@ -360,13 +586,13 @@ impl<'a> UserModel<'a> {
                     .clone();
                 {
                     let ws = self.model.workbook.worksheet_mut(cf_sheet)?;
-                    ws.conditional_formatting[cf_idx].range = new_range.clone();
+                    ws.conditional_formatting[cf_idx].ranges = RangeRef::parse_sqref(&new_range);
                     ws.conditional_formatting[cf_idx].cf_rule = new_rule.clone();
                 }
                 diff_list.push(Diff::UpdateConditionalFormatting {
                     sheet: cf_sheet,
                     index: cf_idx as u32,
-                    old_range: old_cf.range,
+                    old_range: RangeRef::to_sqref(&old_cf.ranges),
                     old_rule: Box::new(old_cf.cf_rule),
                     old_priority: old_cf.priority,
                     new_range,
@@ -374,6 +600,45 @@ impl<'a> UserModel<'a> {
                 });
             }
         } else {
+            // Copy-paste recreates the merged cells of the copied area at the
+            // target. A merge is matched by intersection: it can stick out of
+            // the copied range when its covered cells are empty (the copied
+            // range is clamped to the sheet dimension), and is recreated whole.
+            if !source_merges.is_empty() {
+                let old_merged_cells = self.model.get_merged_cells(sheet)?.to_vec();
+                for m in source_merges {
+                    let merge_area = Area {
+                        sheet,
+                        row: m.row + selected_row - source_first_row,
+                        column: m.column + selected_column - source_first_column,
+                        width: m.width,
+                        height: m.height,
+                    };
+                    // Capture the content and links the merge will clear: a
+                    // merge sticking out of the pasted block can swallow cells
+                    // that were not part of the paste
+                    let mut merge_diffs = self.covered_cells_clear_diffs(&merge_area)?;
+                    // A translated merge can conflict outside the checked
+                    // target area (another merge, an array formula) or fall
+                    // off the sheet: those are skipped, the rest still paste
+                    // merge_cells_keep_styles: the pasted cells already carry
+                    // the merged style pattern of the source; stamping the
+                    // anchor's style would drop the perimeter borders of
+                    // non-anchor cells
+                    if self.model.merge_cells_keep_styles(&merge_area).is_ok() {
+                        diff_list.append(&mut merge_diffs);
+                    }
+                }
+                let new_merged_cells = self.model.get_merged_cells(sheet)?.to_vec();
+                if old_merged_cells != new_merged_cells {
+                    diff_list.push(Diff::SetMergedCells {
+                        sheet,
+                        old_value: old_merged_cells,
+                        new_value: new_merged_cells,
+                    });
+                }
+            }
+
             // Copy-paste: duplicate CF rules from the source area to the target.
             let cf_copies = self.model.get_cf_rules_to_copy(
                 source_sheet,
@@ -400,7 +665,7 @@ impl<'a> UserModel<'a> {
                     .worksheet_mut(sheet)?
                     .conditional_formatting
                     .push(ConditionalFormatting {
-                        range: new_range.clone(),
+                        ranges: RangeRef::parse_sqref(&new_range),
                         cf_rule: new_rule.clone(),
                         priority,
                     });
@@ -449,29 +714,33 @@ impl<'a> UserModel<'a> {
             height: records.len() as i32,
         };
 
+        // Merged cells in the target are replaced by the paste (or reject
+        // it); plain text carries no merges, so contained ones just go
+        let mut diff_list = Vec::new();
+        self.remove_merges_replaced_by_paste(&paste_area, &[], &mut diff_list)?;
+
         // Capture old values BEFORE clearing so undo can restore them correctly.
         let mut old_values: HashMap<(i32, i32), Option<Cell>> = HashMap::new();
         {
             let ws = self.model.workbook.worksheet(sheet)?;
             for r in area.row..area.row + records.len() as i32 {
                 for c in area.column..area.column + max_width {
-                    old_values.insert((r, c), ws.cell(r, c).cloned());
+                    old_values.insert((r, c), ws.cell(r, c).map(Cow::into_owned));
                 }
             }
         }
 
+        // Clearing the target area also removes its links: capture them for undo
+        diff_list.extend(self.range_link_diffs(&paste_area)?);
         self.model.range_clear_contents(&paste_area)?;
 
         // Second pass: write values and build diff list.
-        let mut diff_list = Vec::new();
         let mut row = area.row;
         let mut last_column = area.column;
         for row_data in &records {
             let mut column = area.column;
             for value in row_data {
                 let old_value = old_values.remove(&(row, column)).unwrap_or(None);
-                self.model
-                    .set_user_input(sheet, row, column, value.to_string())?;
                 diff_list.push(Diff::SetCellValue {
                     sheet,
                     row,
@@ -479,6 +748,14 @@ impl<'a> UserModel<'a> {
                     new_value: value.to_string(),
                     old_value: Box::new(old_value),
                 });
+                // pasted URLs are auto-linked: capture the link and style diffs too
+                self.set_user_input_with_link_diffs(
+                    sheet,
+                    row,
+                    column,
+                    value.to_string(),
+                    &mut diff_list,
+                )?;
                 column += 1;
             }
             last_column = last_column.max(column - 1);

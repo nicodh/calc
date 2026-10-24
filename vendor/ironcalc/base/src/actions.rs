@@ -6,9 +6,94 @@ use crate::expressions::parser::stringify::{
 };
 use crate::expressions::parser::Parser as ExprParser;
 use crate::expressions::types::CellReferenceRC;
-use crate::expressions::utils;
+use crate::language::get_default_language;
+use crate::locale::get_default_locale;
 use crate::model::{CellStructure, Model};
-use crate::types::{ArrayKind, Cell};
+use crate::types::{ArrayKind, Cell, Link, MergedCell, RangeRef, Worksheet};
+
+/// Applies `map` to the (row, column) key of every link in the worksheet, so
+/// that links follow their cells when rows or columns are inserted, deleted or
+/// moved: `Some((row, column))` moves the link there, `None` removes it.
+fn displace_links<F>(worksheet: &mut Worksheet, map: F)
+where
+    F: Fn(i32, i32) -> Option<(i32, i32)>,
+{
+    let links = std::mem::take(&mut worksheet.links);
+    worksheet.links = links
+        .into_iter()
+        .filter_map(|((row, column), link)| map(row, column).map(|key| (key, link)))
+        .collect();
+}
+
+/// Applies `map` to the corners (first row, first column, last row, last column)
+/// of every merged cell of the worksheet, so that merged ranges follow their
+/// cells when rows or columns are inserted, deleted or moved. `None` removes
+/// the merged cell; ranges reduced to a single cell are removed as well.
+fn displace_merged_cells<F>(worksheet: &mut Worksheet, map: F)
+where
+    F: Fn(i32, i32, i32, i32) -> Option<(i32, i32, i32, i32)>,
+{
+    let merged_cells = std::mem::take(&mut worksheet.merged_cells);
+    worksheet.merged_cells = merged_cells
+        .into_iter()
+        .filter_map(|m| {
+            map(m.row, m.column, m.last_row(), m.last_column()).map(
+                |(first_row, first_column, last_row, last_column)| MergedCell {
+                    row: first_row,
+                    column: first_column,
+                    width: last_column - first_column + 1,
+                    height: last_row - first_row + 1,
+                },
+            )
+        })
+        .filter(|m| m.width >= 1 && m.height >= 1 && !(m.width == 1 && m.height == 1))
+        .collect();
+}
+
+// Interval arithmetic for a move action: the moved group [group_start, group_end]
+// jumps by `delta` while the displaced zone shifts in the opposite direction.
+// Returns whether the interval [start, end] survives the move without being
+// split: it must be fully inside the moved group, fully inside the displaced
+// zone or fully outside both.
+pub(crate) fn interval_survives_move(
+    start: i32,
+    end: i32,
+    group_start: i32,
+    group_end: i32,
+    delta: i32,
+) -> bool {
+    let (displace_start, displace_end) = if delta > 0 {
+        (group_end + 1, group_end + delta)
+    } else {
+        (group_start + delta, group_start - 1)
+    };
+    let inside = |a: i32, b: i32| start >= a && end <= b;
+    let outside = |a: i32, b: i32| end < a || start > b;
+    (inside(group_start, group_end) || outside(group_start, group_end))
+        && (inside(displace_start, displace_end) || outside(displace_start, displace_end))
+}
+
+// Returns the new position of the interval [start, end] after moving the group
+// [group_start, group_end] by `delta` (`count` is the size of the group).
+// Assumes `interval_survives_move` holds.
+fn displace_interval_for_move(
+    start: i32,
+    end: i32,
+    group_start: i32,
+    group_end: i32,
+    delta: i32,
+    count: i32,
+) -> (i32, i32) {
+    if start >= group_start && end <= group_end {
+        (start + delta, end + delta)
+    } else if delta > 0 && start > group_end && end <= group_end + delta {
+        (start - count, end - count)
+    } else if delta < 0 && start >= group_start + delta && end < group_start {
+        (start + count, end + count)
+    } else {
+        (start, end)
+    }
+}
 
 /// Returns the new row after displacement, or `None` if the row was deleted.
 fn displace_cf_row(row: i32, data: &DisplaceData, sheet: u32) -> Option<i32> {
@@ -84,56 +169,26 @@ fn displace_cf_col(col: i32, data: &DisplaceData, sheet: u32) -> Option<i32> {
     }
 }
 
-/// Displaces a single A1-style sqref part (e.g. "A1" or "A1:B5").
-/// Returns the original string unchanged if any corner would become #REF!.
-fn displace_cf_sqref_part(part: &str, data: &DisplaceData, sheet: u32) -> String {
-    let upper = part.to_uppercase();
-    let segs: Vec<&str> = upper.splitn(2, ':').collect();
-    match segs.len() {
-        1 => {
-            if let Some(r) = utils::parse_reference_a1(segs[0]) {
-                if let (Some(nr), Some(nc)) = (
-                    displace_cf_row(r.row, data, sheet),
-                    displace_cf_col(r.column, data, sheet),
-                ) {
-                    if let Some(c) = utils::number_to_column(nc) {
-                        return format!("{c}{nr}");
-                    }
-                }
-            }
-            part.to_string()
-        }
-        2 => {
-            if let (Some(r1), Some(r2)) = (
-                utils::parse_reference_a1(segs[0]),
-                utils::parse_reference_a1(segs[1]),
-            ) {
-                if let (Some(nr1), Some(nc1), Some(nr2), Some(nc2)) = (
-                    displace_cf_row(r1.row, data, sheet),
-                    displace_cf_col(r1.column, data, sheet),
-                    displace_cf_row(r2.row, data, sheet),
-                    displace_cf_col(r2.column, data, sheet),
-                ) {
-                    if let (Some(c1), Some(c2)) =
-                        (utils::number_to_column(nc1), utils::number_to_column(nc2))
-                    {
-                        return format!("{c1}{nr1}:{c2}{nr2}");
-                    }
-                }
-            }
-            part.to_string()
-        }
-        _ => part.to_string(),
+/// Displaces one axis of a range. An unbounded axis passes through untouched.
+/// Returns `None` if either end would become #REF!.
+fn displace_cf_axis(
+    axis: Option<(i32, i32)>,
+    displace: impl Fn(i32) -> Option<i32>,
+) -> Option<Option<(i32, i32)>> {
+    match axis {
+        Some((lo, hi)) => Some(Some((displace(lo)?, displace(hi)?))),
+        None => Some(None),
     }
 }
 
-/// Displaces every part of a space-separated sqref string.
-fn displace_cf_sqref(sqref: &str, data: &DisplaceData, sheet: u32) -> String {
-    sqref
-        .split_whitespace()
-        .map(|p| displace_cf_sqref_part(p, data, sheet))
-        .collect::<Vec<_>>()
-        .join(" ")
+/// Displaces a range reference, leaving it unchanged if any corner would become #REF!.
+fn displace_cf_range(range: &RangeRef, data: &DisplaceData, sheet: u32) -> RangeRef {
+    let rows = displace_cf_axis(range.rows, |r| displace_cf_row(r, data, sheet));
+    let cols = displace_cf_axis(range.cols, |c| displace_cf_col(c, data, sheet));
+    match (rows, cols) {
+        (Some(rows), Some(cols)) => RangeRef { rows, cols },
+        _ => range.clone(),
+    }
 }
 
 // NOTE: There is a difference with Excel behaviour when deleting cells/rows/columns
@@ -142,6 +197,8 @@ fn displace_cf_sqref(sqref: &str, data: &DisplaceData, sheet: u32) -> String {
 // I feel this is unimportant for now.
 
 /// Displaces a single formula string (with or without leading `=`) using `to_string_displaced`.
+/// CF formulas are stored in English (see [Model::user_formula_to_internal]),
+/// so the caller must have the parser in the default (English) locale/language.
 fn displace_cf_formula_str(
     parser: &mut ExprParser<'_>,
     formula: &str,
@@ -152,7 +209,13 @@ fn displace_cf_formula_str(
     let has_eq = trimmed.starts_with('=');
     let body = if has_eq { &trimmed[1..] } else { trimmed };
     let node = parser.parse(body, context);
-    let displaced = to_string_displaced(&node, context, data);
+    let displaced = to_string_displaced(
+        &node,
+        context,
+        data,
+        get_default_locale(),
+        get_default_language(),
+    );
     if has_eq {
         format!("={displaced}")
     } else {
@@ -280,8 +343,17 @@ impl<'a> Model<'a> {
                 column,
             };
             // FIXME: This is not a very performant way if the formula has changed :S.
+            // Both strings must be in the active locale/language: the displaced
+            // one is written back through the (localized) parser, and comparing
+            // against an English rendering would flag every formula as changed.
             let formula = to_localized_string(node, &cell_reference, self.locale, self.language);
-            let formula_displaced = to_string_displaced(node, &cell_reference, displace_data);
+            let formula_displaced = to_string_displaced(
+                node,
+                &cell_reference,
+                displace_data,
+                self.locale,
+                self.language,
+            );
             if formula != formula_displaced {
                 self.update_cell_with_formula(sheet, row, column, format!("={formula_displaced}"))?;
             };
@@ -301,28 +373,37 @@ impl<'a> Model<'a> {
         Ok(())
     }
 
-    /// Updates the `range` field and formula fields of every CF rule on `sheet` according to `displace_data`.
+    /// Updates the `ranges` field and formula fields of every CF rule on `sheet` according to `displace_data`.
     fn displace_cf_ranges(&mut self, sheet: u32, displace_data: &DisplaceData) {
         let count = match self.workbook.worksheets.get(sheet as usize) {
             Some(ws) => ws.conditional_formatting.len(),
             None => return,
         };
 
-        // Phase 1: collect (index, new_range, old_rule, anchor) without holding a borrow on self.
+        // Phase 1: collect (index, new_ranges, old_rule, anchor) without holding a borrow on self.
         let sheet_name = self.workbook.worksheets[sheet as usize].get_name();
-        let mut phase1: Vec<(usize, String, CfRule, i32, i32)> = Vec::with_capacity(count);
+        let mut phase1: Vec<(usize, Vec<RangeRef>, CfRule, i32, i32)> = Vec::with_capacity(count);
         for idx in 0..count {
             let cf = &self.workbook.worksheets[sheet as usize].conditional_formatting[idx];
-            let old_range = cf.range.clone();
-            let new_range = displace_cf_sqref(&old_range, displace_data, sheet);
+            let new_ranges = cf
+                .ranges
+                .iter()
+                .map(|r| displace_cf_range(r, displace_data, sheet))
+                .collect();
             let rule = cf.cf_rule.clone();
-            if let Some((anchor_row, anchor_col)) = cf_sqref_anchor(&old_range) {
-                phase1.push((idx, new_range, rule, anchor_row, anchor_col));
+            if let Some((anchor_row, anchor_col)) = cf_sqref_anchor(&cf.ranges) {
+                phase1.push((idx, new_ranges, rule, anchor_row, anchor_col));
             }
         }
 
         // Phase 2: displace formula fields (requires &mut self.parser) then write back.
-        for (idx, new_range, rule, anchor_row, anchor_col) in phase1 {
+        // CF formulas are stored in English, so parse them with the default
+        // locale/language regardless of the active ones.
+        let locale = self.locale;
+        let language = self.language;
+        self.parser.set_locale(get_default_locale());
+        self.parser.set_language(get_default_language());
+        for (idx, new_ranges, rule, anchor_row, anchor_col) in phase1 {
             let context = CellReferenceRC {
                 sheet: sheet_name.clone(),
                 row: anchor_row,
@@ -330,9 +411,12 @@ impl<'a> Model<'a> {
             };
             let new_rule =
                 displace_cf_rule_formulas(&mut self.parser, rule, &context, displace_data);
-            self.workbook.worksheets[sheet as usize].conditional_formatting[idx].range = new_range;
+            self.workbook.worksheets[sheet as usize].conditional_formatting[idx].ranges =
+                new_ranges;
             self.workbook.worksheets[sheet as usize].conditional_formatting[idx].cf_rule = new_rule;
         }
+        self.parser.set_locale(locale);
+        self.parser.set_language(language);
     }
 
     /// Retrieves the column indices for a specific row in a given sheet, sorted in ascending or descending order.
@@ -355,16 +439,11 @@ impl<'a> Model<'a> {
         descending: bool,
     ) -> Result<Vec<i32>, String> {
         let worksheet = self.workbook.worksheet(sheet)?;
-        if let Some(row_data) = worksheet.sheet_data.get(&row) {
-            let mut columns: Vec<i32> = row_data.keys().copied().collect();
-            columns.sort_unstable();
-            if descending {
-                columns.reverse();
-            }
-            Ok(columns)
-        } else {
-            Ok(vec![])
+        let mut columns = worksheet.sheet_data.columns_in_row(row);
+        if descending {
+            columns.reverse();
         }
+        Ok(columns)
     }
 
     /// Moves the contents of cell (source_row, source_column) to (target_row, target_column).
@@ -392,14 +471,14 @@ impl<'a> Model<'a> {
             .worksheet(sheet)?
             .cell(source_row, source_column)
         {
-            Some(c) => c,
+            Some(c) => c.into_owned(),
             None => return Ok(()),
         };
         let style = source_cell.get_style();
 
         let mut array = None;
 
-        match source_cell {
+        match &source_cell {
             Cell::EmptyCell { .. }
             | Cell::BooleanCell { .. }
             | Cell::NumberCell { .. }
@@ -408,11 +487,24 @@ impl<'a> Model<'a> {
             | Cell::CellFormula { .. } => {
                 // This is a regular cell, we can just move it.
             }
-            Cell::SpillCell { .. } => {
-                // This the spill of an array formula. Because dynamic arrays spills have been deleted
-                // We delete the spill
+            Cell::SpillCell { a, .. } => {
+                // A cell of a CSE array is moved together with its anchor, whether
+                // the anchor has already been relocated (this is then a cell of the
+                // array at its new place) or is still to come: leave it alone.
+                // Anything else is the stale spill of a dynamic array (those have
+                // been reset by the caller): drop it.
                 let worksheet = self.workbook.worksheet_mut(sheet)?;
-                worksheet.remove_cell(source_row, source_column)?;
+                let live_cse = matches!(
+                    worksheet.cell(a.0, a.1).as_deref(),
+                    Some(Cell::ArrayFormula { r: (width, height), kind: ArrayKind::Cse, .. })
+                        if source_row >= a.0
+                            && source_row < a.0 + height
+                            && source_column >= a.1
+                            && source_column < a.1 + width
+                );
+                if !live_cse {
+                    worksheet.remove_cell(source_row, source_column)?;
+                }
                 return Ok(());
             }
             Cell::ArrayFormula {
@@ -445,7 +537,17 @@ impl<'a> Model<'a> {
             });
 
         if let Some((width, height)) = array {
-            // We are moving an array formula, we need to move the whole range
+            // We are moving an array formula, we need to move the whole range.
+            // Its cells are removed first: the new area may overlap the old one,
+            // and `set_user_array_formula` refuses to cover an array formula.
+            let worksheet = self.workbook.worksheet_mut(sheet)?;
+            for r in source_row..source_row + height {
+                for c in source_column..source_column + width {
+                    if worksheet.cell(r, c).is_some() {
+                        worksheet.remove_cell(r, c)?;
+                    }
+                }
+            }
             self.set_user_array_formula(
                 sheet,
                 target_row,
@@ -462,8 +564,12 @@ impl<'a> Model<'a> {
         // copy style
         worksheet.set_cell_style(target_row, target_column, style)?;
 
-        // delete source cell content and style
-        worksheet.remove_cell(source_row, source_column)?;
+        // delete source cell content and style (an array's cells are gone
+        // already, and the source position may now hold a cell of the array
+        // at its new place)
+        if array.is_none() {
+            worksheet.remove_cell(source_row, source_column)?;
+        }
         Ok(())
     }
 
@@ -500,8 +606,11 @@ impl<'a> Model<'a> {
             );
         }
         self.reset_dynamic_array_spills(sheet)?;
+        // Merged ranges are remapped at the end; take them out so the cell moves
+        // (which go through `set_user_input`) do not trip the covered-cell guard.
+        let merged_cells = std::mem::take(&mut self.workbook.worksheet_mut(sheet)?.merged_cells);
         let worksheet = self.workbook.worksheet(sheet)?;
-        let all_rows: Vec<i32> = worksheet.sheet_data.keys().copied().collect();
+        let all_rows = worksheet.sheet_data.rows();
         for row in all_rows {
             let sorted_columns = self.get_columns_for_row(sheet, row, true)?;
             for col in sorted_columns {
@@ -513,6 +622,37 @@ impl<'a> Model<'a> {
                 }
             }
         }
+
+        // Links move with their cells
+        displace_links(self.workbook.worksheet_mut(sheet)?, |r, c| {
+            if c >= column {
+                Some((r, c + column_count))
+            } else {
+                Some((r, c))
+            }
+        });
+
+        // Merged ranges shift right or grow when columns are inserted inside them
+        self.workbook.worksheet_mut(sheet)?.merged_cells = merged_cells;
+        displace_merged_cells(
+            self.workbook.worksheet_mut(sheet)?,
+            |first_row, first_column, last_row, last_column| {
+                let first = if first_column >= column {
+                    first_column + column_count
+                } else {
+                    first_column
+                };
+                let last = if last_column >= column {
+                    last_column + column_count
+                } else {
+                    last_column
+                };
+                if first > LAST_COLUMN {
+                    return None;
+                }
+                Some((first_row, first, last_row, last.min(LAST_COLUMN)))
+            },
+        );
 
         // Update all formulas in the workbook
         let disp = DisplaceData::Column {
@@ -582,6 +722,9 @@ impl<'a> Model<'a> {
         }
 
         self.reset_dynamic_array_spills(sheet)?;
+        // Merged ranges are remapped at the end; take them out so the cell moves
+        // (which go through `set_user_input`) do not trip the covered-cell guard.
+        let merged_cells = std::mem::take(&mut self.workbook.worksheet_mut(sheet)?.merged_cells);
         // first column being deleted
         let column_start = column;
         // last column being deleted
@@ -589,9 +732,7 @@ impl<'a> Model<'a> {
 
         // Move cells
         let worksheet = &self.workbook.worksheet(sheet)?;
-        let mut all_rows: Vec<i32> = worksheet.sheet_data.keys().copied().collect();
-        // We do not need to do that, but it is safer to eliminate sources of randomness in the algorithm
-        all_rows.sort_unstable();
+        let all_rows = worksheet.sheet_data.rows();
 
         for r in all_rows {
             let columns: Vec<i32> = self.get_columns_for_row(sheet, r, false)?;
@@ -605,6 +746,43 @@ impl<'a> Model<'a> {
                 }
             }
         }
+        // Links move with their cells; the links of the deleted columns are removed
+        displace_links(self.workbook.worksheet_mut(sheet)?, |r, c| {
+            if c < column_start {
+                Some((r, c))
+            } else if c <= column_end {
+                None
+            } else {
+                Some((r, c - column_count))
+            }
+        });
+
+        // Merged ranges shrink or shift left; fully deleted ones are removed
+        self.workbook.worksheet_mut(sheet)?.merged_cells = merged_cells;
+        displace_merged_cells(
+            self.workbook.worksheet_mut(sheet)?,
+            |first_row, first_column, last_row, last_column| {
+                let first = if first_column < column_start {
+                    first_column
+                } else if first_column <= column_end {
+                    column_start
+                } else {
+                    first_column - column_count
+                };
+                let last = if last_column < column_start {
+                    last_column
+                } else if last_column <= column_end {
+                    column_start - 1
+                } else {
+                    last_column - column_count
+                };
+                if last < first {
+                    return None;
+                }
+                Some((first_row, first, last_row, last))
+            },
+        );
+
         // Update all formulas in the workbook
         let disp = DisplaceData::Column {
             sheet,
@@ -684,8 +862,8 @@ impl<'a> Model<'a> {
             let worksheet = self.workbook.worksheet(sheet)?;
             worksheet
                 .sheet_data
-                .iter()
-                .flat_map(|(r, row_data)| row_data.keys().map(move |c| (*r, *c)))
+                .cells()
+                .map(|(r, c, _)| (r, c))
                 .collect()
         };
         for (r, c) in cell_coords {
@@ -714,8 +892,8 @@ impl<'a> Model<'a> {
             let worksheet = self.workbook.worksheet(sheet)?;
             worksheet
                 .sheet_data
-                .iter()
-                .flat_map(|(r, row_data)| row_data.keys().map(move |c| (*r, *c)))
+                .cells()
+                .map(|(r, c, _)| (r, c))
                 .collect()
         };
         for (r, c) in cell_coords {
@@ -739,8 +917,8 @@ impl<'a> Model<'a> {
             let worksheet = self.workbook.worksheet(sheet)?;
             worksheet
                 .sheet_data
-                .iter()
-                .flat_map(|(r, row_data)| row_data.keys().map(move |c| (*r, *c)))
+                .cells()
+                .map(|(r, c, _)| (r, c))
                 .collect()
         };
         for (r, c) in cell_coords {
@@ -771,8 +949,8 @@ impl<'a> Model<'a> {
             let worksheet = self.workbook.worksheet(sheet)?;
             worksheet
                 .sheet_data
-                .iter()
-                .flat_map(|(r, row_data)| row_data.keys().map(move |c| (*r, *c)))
+                .cells()
+                .map(|(r, c, _)| (r, c))
                 .collect()
         };
         for (r, c) in cell_coords {
@@ -815,10 +993,12 @@ impl<'a> Model<'a> {
         }
 
         self.reset_dynamic_array_spills(sheet)?;
+        // Merged ranges are remapped at the end; take them out so the cell moves
+        // (which go through `set_user_input`) do not trip the covered-cell guard.
+        let merged_cells = std::mem::take(&mut self.workbook.worksheet_mut(sheet)?.merged_cells);
         // Move cells
         let worksheet = &self.workbook.worksheet(sheet)?;
-        let mut all_rows: Vec<i32> = worksheet.sheet_data.keys().copied().collect();
-        all_rows.sort_unstable();
+        let mut all_rows = worksheet.sheet_data.rows();
         all_rows.reverse();
         for r in all_rows {
             if r >= row {
@@ -847,6 +1027,37 @@ impl<'a> Model<'a> {
             }
         }
         self.workbook.worksheets[sheet as usize].rows = new_rows;
+
+        // Links move with their cells
+        displace_links(self.workbook.worksheet_mut(sheet)?, |r, c| {
+            if r >= row {
+                Some((r + row_count, c))
+            } else {
+                Some((r, c))
+            }
+        });
+
+        // Merged ranges shift down or grow when rows are inserted inside them
+        self.workbook.worksheet_mut(sheet)?.merged_cells = merged_cells;
+        displace_merged_cells(
+            self.workbook.worksheet_mut(sheet)?,
+            |first_row, first_column, last_row, last_column| {
+                let first = if first_row >= row {
+                    first_row + row_count
+                } else {
+                    first_row
+                };
+                let last = if last_row >= row {
+                    last_row + row_count
+                } else {
+                    last_row
+                };
+                if first > LAST_ROW {
+                    return None;
+                }
+                Some((first, first_column, last.min(LAST_ROW), last_column))
+            },
+        );
 
         // Update all formulas in the workbook
         let disp = DisplaceData::Row {
@@ -882,10 +1093,12 @@ impl<'a> Model<'a> {
         }
 
         self.reset_dynamic_array_spills(sheet)?;
+        // Merged ranges are remapped at the end; take them out so the cell moves
+        // (which go through `set_user_input`) do not trip the covered-cell guard.
+        let merged_cells = std::mem::take(&mut self.workbook.worksheet_mut(sheet)?.merged_cells);
         // Move cells
         let worksheet = &self.workbook.worksheet(sheet)?;
-        let mut all_rows: Vec<i32> = worksheet.sheet_data.keys().copied().collect();
-        all_rows.sort_unstable();
+        let all_rows = worksheet.sheet_data.rows();
 
         for r in all_rows {
             if r >= row {
@@ -898,7 +1111,7 @@ impl<'a> Model<'a> {
                     }
                 } else {
                     // remove all cells in row
-                    self.workbook.worksheet_mut(sheet)?.sheet_data.remove(&r);
+                    self.workbook.worksheet_mut(sheet)?.sheet_data.remove_row(r);
                 }
             }
         }
@@ -918,6 +1131,44 @@ impl<'a> Model<'a> {
             }
         }
         self.workbook.worksheets[sheet as usize].rows = new_rows;
+
+        // Links move with their cells; the links of the deleted rows are removed
+        displace_links(self.workbook.worksheet_mut(sheet)?, |r, c| {
+            if r < row {
+                Some((r, c))
+            } else if r < row + row_count {
+                None
+            } else {
+                Some((r - row_count, c))
+            }
+        });
+
+        // Merged ranges shrink or shift up; fully deleted ones are removed
+        self.workbook.worksheet_mut(sheet)?.merged_cells = merged_cells;
+        displace_merged_cells(
+            self.workbook.worksheet_mut(sheet)?,
+            |first_row, first_column, last_row, last_column| {
+                let first = if first_row < row {
+                    first_row
+                } else if first_row < row + row_count {
+                    row
+                } else {
+                    first_row - row_count
+                };
+                let last = if last_row < row {
+                    last_row
+                } else if last_row < row + row_count {
+                    row - 1
+                } else {
+                    last_row - row_count
+                };
+                if last < first {
+                    return None;
+                }
+                Some((first, first_column, last, last_column))
+            },
+        );
+
         let disp = DisplaceData::Row {
             sheet,
             row,
@@ -932,6 +1183,30 @@ impl<'a> Model<'a> {
     // Caller must have validated and reset spills before calling this.
     fn move_column_unchecked(&mut self, sheet: u32, column: i32, delta: i32) -> Result<(), String> {
         let target_column = column + delta;
+
+        // Links move with their cells: take the moved column's links out and
+        // shift the links of the columns in between. The moved links are
+        // re-attached at the end, after the cells have been rebuilt (rebuilding
+        // goes through `set_user_input`, which could auto-link URL-like values).
+        let worksheet = self.workbook.worksheet_mut(sheet)?;
+        let moved_links: Vec<(i32, Link)> = worksheet
+            .links
+            .iter()
+            .filter(|(&(_, c), _)| c == column)
+            .map(|(&(r, _), link)| (r, link.clone()))
+            .collect();
+        displace_links(worksheet, |r, c| {
+            if c == column {
+                None
+            } else if delta > 0 && c > column && c <= target_column {
+                Some((r, c - 1))
+            } else if delta < 0 && c >= target_column && c < column {
+                Some((r, c + 1))
+            } else {
+                Some((r, c))
+            }
+        });
+
         let original_refs = self
             .workbook
             .worksheet(sheet)?
@@ -942,7 +1217,8 @@ impl<'a> Model<'a> {
                 .workbook
                 .worksheet(sheet)?
                 .cell(r.row, column)
-                .ok_or("Expected Cell to exist")?;
+                .ok_or("Expected Cell to exist")?
+                .into_owned();
             let style_idx = cell.get_style();
             let formula_or_value =
                 self.get_cell_formula(sheet, r.row, column)?
@@ -956,7 +1232,7 @@ impl<'a> Model<'a> {
 
             let mut array = None;
 
-            match cell {
+            match &cell {
                 Cell::EmptyCell { .. }
                 | Cell::BooleanCell { .. }
                 | Cell::NumberCell { .. }
@@ -1042,6 +1318,14 @@ impl<'a> Model<'a> {
         self.workbook
             .worksheet_mut(sheet)?
             .set_column_width_and_style(target_column, width, hidden, style)?;
+
+        // Re-attach the moved links, discarding any link the rebuild auto-created
+        let worksheet = self.workbook.worksheet_mut(sheet)?;
+        worksheet.links.retain(|&(_, c), _| c != target_column);
+        for (r, link) in moved_links {
+            worksheet.links.insert((r, target_column), link);
+        }
+
         let disp = DisplaceData::ColumnMove {
             sheet,
             column,
@@ -1055,6 +1339,30 @@ impl<'a> Model<'a> {
     // Inner row move: no boundary/can check, no spill reset.
     fn move_row_unchecked(&mut self, sheet: u32, row: i32, delta: i32) -> Result<(), String> {
         let target_row = row + delta;
+
+        // Links move with their cells: take the moved row's links out and shift
+        // the links of the rows in between. The moved links are re-attached at
+        // the end, after the cells have been rebuilt (rebuilding goes through
+        // `set_user_input`, which could auto-link URL-like values).
+        let worksheet = self.workbook.worksheet_mut(sheet)?;
+        let moved_links: Vec<(i32, Link)> = worksheet
+            .links
+            .iter()
+            .filter(|(&(r, _), _)| r == row)
+            .map(|(&(_, c), link)| (c, link.clone()))
+            .collect();
+        displace_links(worksheet, |r, c| {
+            if r == row {
+                None
+            } else if delta > 0 && r > row && r <= target_row {
+                Some((r - 1, c))
+            } else if delta < 0 && r >= target_row && r < row {
+                Some((r + 1, c))
+            } else {
+                Some((r, c))
+            }
+        });
+
         let original_cols = self.get_columns_for_row(sheet, row, false)?;
         let mut original_cells = Vec::new();
         for c in &original_cols {
@@ -1062,14 +1370,15 @@ impl<'a> Model<'a> {
                 .workbook
                 .worksheet(sheet)?
                 .cell(row, *c)
-                .ok_or("Expected Cell to exist")?;
+                .ok_or("Expected Cell to exist")?
+                .into_owned();
             let style_idx = cell.get_style();
             let formula_or_value = self.get_cell_formula(sheet, row, *c)?.unwrap_or_else(|| {
                 cell.get_localized_text(&self.workbook.shared_strings, self.locale, self.language)
             });
             let mut array = None;
 
-            match cell {
+            match &cell {
                 Cell::EmptyCell { .. }
                 | Cell::BooleanCell { .. }
                 | Cell::NumberCell { .. }
@@ -1160,6 +1469,14 @@ impl<'a> Model<'a> {
             }
         }
         worksheet.rows = new_rows;
+
+        // Re-attach the moved links, discarding any link the rebuild auto-created
+        let worksheet = self.workbook.worksheet_mut(sheet)?;
+        worksheet.links.retain(|&(r, _), _| r != target_row);
+        for (c, link) in moved_links {
+            worksheet.links.insert((target_row, c), link);
+        }
+
         let disp = DisplaceData::RowMove { sheet, row, delta };
         self.displace_cells(&disp)?;
         self.displace_cf_ranges(sheet, &disp);
@@ -1209,8 +1526,8 @@ impl<'a> Model<'a> {
             let worksheet = self.workbook.worksheet(sheet)?;
             worksheet
                 .sheet_data
-                .iter()
-                .flat_map(|(r, row_data)| row_data.keys().map(move |c| (*r, *c)))
+                .cells()
+                .map(|(r, c, _)| (r, c))
                 .collect()
         };
 
@@ -1288,8 +1605,8 @@ impl<'a> Model<'a> {
             let worksheet = self.workbook.worksheet(sheet)?;
             worksheet
                 .sheet_data
-                .iter()
-                .flat_map(|(r, row_data)| row_data.keys().map(move |c| (*r, *c)))
+                .cells()
+                .map(|(r, c, _)| (r, c))
                 .collect()
         };
 
@@ -1359,7 +1676,22 @@ impl<'a> Model<'a> {
                 "Cannot move columns because that would split an array formula".to_string(),
             );
         }
+        let group_end = column + column_count - 1;
+        if self
+            .workbook
+            .worksheet(sheet)?
+            .merged_cells
+            .iter()
+            .any(|m| !interval_survives_move(m.column, m.last_column(), column, group_end, delta))
+        {
+            return Err("Cannot move columns because that would split a merged cell".to_string());
+        }
         self.reset_dynamic_array_spills(sheet)?;
+
+        // Merged ranges are remapped wholesale at the end; take them out so the
+        // per-column rebuild (which goes through `set_user_input`) does not trip
+        // over the covered-cell guard.
+        let merged_cells = std::mem::take(&mut self.workbook.worksheet_mut(sheet)?.merged_cells);
 
         // Move columns in the correct order
         if delta > 0 {
@@ -1371,6 +1703,23 @@ impl<'a> Model<'a> {
                 self.move_column_unchecked(sheet, col, delta)?;
             }
         }
+
+        self.workbook.worksheet_mut(sheet)?.merged_cells = merged_cells
+            .into_iter()
+            .map(|mut m| {
+                let (first, last) = displace_interval_for_move(
+                    m.column,
+                    m.last_column(),
+                    column,
+                    group_end,
+                    delta,
+                    column_count,
+                );
+                m.column = first;
+                m.width = last - first + 1;
+                m
+            })
+            .collect();
 
         Ok(())
     }
@@ -1402,7 +1751,22 @@ impl<'a> Model<'a> {
         if !self.can_move_rows_action(sheet, row, row_count, delta)? {
             return Err("Cannot move rows because that would split an array formula".to_string());
         }
+        let group_end = row + row_count - 1;
+        if self
+            .workbook
+            .worksheet(sheet)?
+            .merged_cells
+            .iter()
+            .any(|m| !interval_survives_move(m.row, m.last_row(), row, group_end, delta))
+        {
+            return Err("Cannot move rows because that would split a merged cell".to_string());
+        }
         self.reset_dynamic_array_spills(sheet)?;
+
+        // Merged ranges are remapped wholesale at the end; take them out so the
+        // per-row rebuild (which goes through `set_user_input`) does not trip
+        // over the covered-cell guard.
+        let merged_cells = std::mem::take(&mut self.workbook.worksheet_mut(sheet)?.merged_cells);
 
         // Move rows in the correct order
         if delta > 0 {
@@ -1414,6 +1778,24 @@ impl<'a> Model<'a> {
                 self.move_row_unchecked(sheet, r, delta)?;
             }
         }
+
+        self.workbook.worksheet_mut(sheet)?.merged_cells = merged_cells
+            .into_iter()
+            .map(|mut m| {
+                let (first, last) = displace_interval_for_move(
+                    m.row,
+                    m.last_row(),
+                    row,
+                    group_end,
+                    delta,
+                    row_count,
+                );
+                m.row = first;
+                m.height = last - first + 1;
+                m
+            })
+            .collect();
+
         Ok(())
     }
 }

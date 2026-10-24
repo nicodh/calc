@@ -213,3 +213,53 @@ fn test_xmatch_row_vector() {
     model.evaluate();
     assert_eq!(model._get_text("A3"), "2");
 }
+
+// ── array constants as lookup_array ─────────────────────────────────────────────
+
+#[test]
+fn test_xmatch_array_constant_wildcard() {
+    let mut model = new_empty_model();
+    // Wildcard match against an in-formula array constant.
+    model._set("A1", r#"=XMATCH("ban*", {"apple","banana","cherry"}, 2)"#);
+    model.evaluate();
+    assert_eq!(model._get_text("A1"), "2");
+}
+
+#[test]
+fn test_xmatch_array_constant_numeric() {
+    let mut model = new_empty_model();
+    // Exact numeric match against a numeric array constant.
+    model._set("A1", "=XMATCH(30, {10,20,30,40,50})");
+    // Exact-or-next-larger against a numeric array constant.
+    model._set("A2", "=XMATCH(35, {10,20,30,40,50}, 1)");
+    // A column-oriented array constant works too.
+    model._set("A3", "=XMATCH(30, {10;20;30;40;50})");
+    // Not found is #N/A, not #VALUE!.
+    model._set("A4", "=XMATCH(99, {10,20,30})");
+    model.evaluate();
+    assert_eq!(model._get_text("A1"), "3");
+    assert_eq!(model._get_text("A2"), "4");
+    assert_eq!(model._get_text("A3"), "3");
+    assert_eq!(model._get_text("A4"), "#N/A");
+}
+
+// ── whole-column lookup array and a spill beyond the used area ───────────────
+
+// XMATCH clips a whole-column lookup array to the sheet's used area. When it
+// runs inside an anchor, the array it looks in may be spilled on demand
+// during the walk, past the bound the walk was clipped to. The skipped part
+// is on record, so the spill restarts the pass and the match is found.
+#[test]
+fn test_xmatch_whole_column_sees_a_spill_beyond_the_used_area() {
+    let mut model = new_empty_model();
+    model._set("A1", "=SEQUENCE(1,1,XMATCH(5,D:D))");
+    model._set("C1", "=SEQUENCE(3,1,10)");
+    model._set("D1", "=SEQUENCE(5)");
+    model.evaluate();
+    assert_eq!(model._get_text("A1"), "5");
+    assert_eq!(model.evaluation.restarts_in_last_evaluation, 1);
+
+    model.evaluate();
+    assert_eq!(model._get_text("A1"), "5");
+    assert_eq!(model.evaluation.restarts_in_last_evaluation, 0);
+}

@@ -6,6 +6,7 @@ import { Button } from "../../Button/Button";
 import { IconButton } from "../../Button/IconButton";
 import { Input } from "../../Input/Input";
 import { Select } from "../../Select/Select";
+import { Textarea } from "../../Textarea/Textarea";
 import { Tooltip } from "../../Tooltip/Tooltip";
 import { getFullRangeToString } from "../../util";
 import "./edit-name-range.css";
@@ -75,7 +76,13 @@ const EditNamedRange = ({
   };
 
   const [name, setName] = useState(getDefaultName());
-  const [scope, setScope] = useState(initialScope);
+  const worksheets = model.getWorksheetsProperties();
+  // Track the scope by sheet_id so it survives sheet renames
+  const [scopeSheetId, setScopeSheetId] = useState(
+    () => worksheets.find((s) => s.name === initialScope)?.sheet_id,
+  );
+  const scope =
+    worksheets.find((s) => s.sheet_id === scopeSheetId)?.name ?? "[Global]";
   const [formula, setFormula] = useState(initialFormula);
   const [nameError, setNameError] = useState<string>("");
   const [formulaError, setFormulaError] = useState<string>("");
@@ -163,7 +170,11 @@ const EditNamedRange = ({
             label={t("name_manager_dialog.scope_label")}
             helperText={t("name_manager_dialog.scope_helper")}
             value={scope}
-            onChange={setScope}
+            onChange={(value) =>
+              setScopeSheetId(
+                worksheets.find((s) => s.name === value)?.sheet_id,
+              )
+            }
             options={[
               {
                 value: "[Global]",
@@ -194,7 +205,7 @@ const EditNamedRange = ({
                   </>
                 ),
               },
-              ...model.getWorksheetsProperties().map((option) => ({
+              ...worksheets.map((option) => ({
                 value: option.name,
                 label: (
                   <span
@@ -211,7 +222,7 @@ const EditNamedRange = ({
               })),
             ]}
           />
-          <Input
+          <Textarea
             label={t("name_manager_dialog.refers_to")}
             placeholder={t("name_manager_dialog.enter_formula")}
             value={formula}

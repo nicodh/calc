@@ -1,3 +1,14 @@
+# Two wasm-pack builds from this crate:
+#   pkg/       — @ironcalc/wasm       (engine only, default)
+#   pkg-xlsx/  — @ironcalc/wasm-xlsx  (engine + xlsx import/export)
+#
+# The xlsx APIs are gated on `--features xlsx`, so the default bundle stays
+# the same size. Both builds go through wasm-pack (and therefore wasm-opt).
+#
+# Each package ships LICENSE-MIT, LICENSE-Apache-2.0 and a generated
+# THIRD-PARTY-NOTICES.md (see third_party_notices.py) so that users can
+# redistribute it with the required notices.
+
 # In some platforms, python is called python3
 PYTHON := $(shell command -v python 2>/dev/null || command -v python3 2>/dev/null)
 
@@ -6,15 +17,72 @@ ifeq ($(PYTHON),)
   $(error No python found. Please install python.)
 endif
 
-all:
+# Content hash of everything that feeds the wasm builds. The build targets are
+# stamp files named after it, so `make wasm` / `make xlsx` are no-ops while the
+# sources are unchanged.
+# Requires a git checkout.
+SRC_HASH := $(shell cd ../.. && git ls-files -co --exclude-standard -- bindings/wasm base xlsx Cargo.toml Cargo.lock | sort | while IFS= read -r f; do [ -f "$$f" ] && printf '%s\n' "$$(pwd)/$$f"; done | git hash-object --stdin-paths | git hash-object --stdin)
+
+all: wasm xlsx
+
+wasm: pkg/.built-$(SRC_HASH)
+
+# `deps` and `types.js` are order-only (after the |): `deps` is .PHONY and
+# would otherwise force the stamp to rebuild on every run, and types.js only
+# changes when types.ts does, which the hash already covers.
+pkg/.built-$(SRC_HASH): | deps types.js
 	wasm-pack build --target web --scope ironcalc --release
 	cp README.pkg.md pkg/README.md
-	npx tsc --ignoreConfig types.ts --target esnext --module esnext
-	$(PYTHON) fix_types.py
+	$(PYTHON) fix_types.py pkg
+	$(PYTHON) fix_package.py pkg
+	cp ../../LICENSE-MIT ../../LICENSE-Apache-2.0 pkg/
+	$(PYTHON) third_party_notices.py --manifest-path Cargo.toml --name @ironcalc/wasm \
+		--target wasm32-unknown-unknown \
+		--include ../../base/THIRD-PARTY-NOTICES.md --output pkg/THIRD-PARTY-NOTICES.md
+	node --test tests/test_package.mjs
+	rm -f pkg/.built-*
+	touch $@
+
+xlsx: pkg-xlsx/.built-$(SRC_HASH)
+
+pkg-xlsx/.built-$(SRC_HASH): | deps types.js
+	wasm-pack build --target web --scope ironcalc --release --out-dir pkg-xlsx -- --features xlsx
+	cp README.pkg-xlsx.md pkg-xlsx/README.md
+	$(PYTHON) fix_types.py pkg-xlsx
+	$(PYTHON) fix_package.py pkg-xlsx @ironcalc/wasm-xlsx
+	cp ../../LICENSE-MIT ../../LICENSE-Apache-2.0 pkg-xlsx/
+	$(PYTHON) third_party_notices.py --manifest-path Cargo.toml --name @ironcalc/wasm-xlsx \
+		--target wasm32-unknown-unknown --features xlsx \
+		--include ../../base/THIRD-PARTY-NOTICES.md --output pkg-xlsx/THIRD-PARTY-NOTICES.md
+	PKG_DIR=pkg-xlsx node --test tests/test_package.mjs
+	rm -f pkg-xlsx/.built-*
+	touch $@
+
+# types.ts compiles to types.js, which fix_types.py prepends to the pkg's
+# wasm.js. One shared target so parallel `make -j` builds don't race on it.
+types.js: types.ts | deps
+	pnpm exec tsc --ignoreConfig types.ts --target esnext --module esnext
+
+# Installs the pinned JS tooling (typescript, typedoc) from pnpm-lock.yaml
+deps:
+	pnpm install --frozen-lockfile
+
+# Builds the collaborative (Stable) model bindings into pkg/, with the xlsx
+# import/export included so the collab demo story can load files.
+collab: deps
+	wasm-pack build --target web --scope ironcalc --release -- --features collab,xlsx
+	cp README.pkg.md pkg/README.md
+	pnpm exec tsc --ignoreConfig types.ts --target esnext --module esnext
+	$(PYTHON) fix_types.py pkg
+	$(PYTHON) fix_package.py pkg
 	rm -f types.js
 
+# The nodejs test builds go to their own out-dirs so they don't clobber the
+# publishable web builds in pkg/ and pkg-xlsx/. They use --dev (no
+# optimizations, no wasm-opt) since they only exist to run the tests.
 tests:
-	wasm-pack build --target nodejs && node tests/test.mjs && node tests/test_cf.mjs
+	wasm-pack build --dev --target nodejs --out-dir pkg-nodejs && node tests/test.mjs && node tests/test_cf.mjs
+	wasm-pack build --dev --target nodejs --out-dir pkg-nodejs-xlsx -- --features xlsx && node tests/test_xlsx.mjs
 
 lint:
 	cargo check
@@ -23,7 +91,7 @@ lint:
 
 clean:
 	cargo clean
-	rm -rf pkg
+	rm -rf pkg pkg-xlsx pkg-nodejs pkg-nodejs-xlsx
 	rm -f types.js
 
-.PHONY: all lint clean tests
+.PHONY: all wasm xlsx deps collab lint clean tests

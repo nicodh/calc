@@ -9,8 +9,9 @@ You can sync your sheets with other group members.
 
 ## Building
 
-In order to fix a focus/input loss behavior in Ironcalc, for the time being
-we depend on a vendored IronCalc in `vendor/ironcalc` (see
+Syncing uses IronCalc's collaborative model, which is still in review
+upstream (PRs #1477-#1479). For the time being we depend on a vendored IronCalc
+in `vendor/ironcalc` with those PRs merged (see
 [vendor/README.md](vendor/README.md)).
 
 It needs to build before we can create the .xdc app.
@@ -23,8 +24,10 @@ You first need `wasm-pack`, a Rust toolchain and `python`. It produces
 
 ```bash
 cd vendor/ironcalc/bindings/wasm
-make
+make collab
 ```
+
+`make collab` builds the collaborative model, with xlsx support, into `pkg/`.
 
 ### Build the IronCalc JS UI library
 

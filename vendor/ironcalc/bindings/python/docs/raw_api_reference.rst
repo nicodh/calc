@@ -1,210 +1,205 @@
-
 Raw API Reference
 -----------------
 
-In general methods in IronCalc use a 0-index base for the the sheet index and 1-index base for the row and column indexes.
+The raw API (:class:`Model`) is a low level API. Nothing is evaluated
+automatically: call :meth:`Model.evaluate` after making changes, otherwise the
+workbook may be in an inconsistent state. There is no undo/redo history and no
+diffs are produced. It is faster and more flexible than the user API, but
+easier to get wrong.
 
+Conventions are the same as in the user API: 0-based ``sheet`` indexes,
+1-based ``row`` and ``column`` indexes, dictionaries for complex values and
+:class:`WorkbookError` on invalid input.
 
-.. method:: evaluate()
+Evaluation and persistence
+^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-   Evaluates the model. This needs to be done after each change, otherwise the model might be on a broken state.
+.. method:: Model.evaluate()
 
-.. method:: set_user_input(sheet: int, row: int, column: int, value: str)
+   Evaluates the workbook. Call this after each batch of changes.
 
-      Sets an input in a cell, as would be done by a user typing into a spreadsheet cell.
+.. method:: Model.save_to_xlsx(file: str)
+.. method:: Model.save_to_icalc(file: str)
+.. method:: Model.to_xlsx() -> bytes
 
-      :param sheet: The sheet index (0-based).
-      :param row: The 1-based row index (first row is 1).
-      :param column: The 1-based column index (column “A” is 1).
-      :param value: The value to set, e.g. ``"123"`` or ``"=A1*2"``.
+   Returns the workbook as bytes in xlsx format.
 
-.. method:: clear_cell_contents(sheet: int, row: int, column: int)
+.. method:: Model.to_bytes() -> bytes
 
-      Removes the content of the cell but leaves the style intact.
+Setting values
+^^^^^^^^^^^^^^
 
-      :param sheet: The sheet index (0-based).
-      :param row: The 1-based row index (first row is 1).
-      :param column: The 1-based column index (column “A” is 1).
+.. method:: Model.set_user_input(sheet: int, row: int, column: int, value: str)
 
-.. method:: get_cell_content(sheet: int, row: int, column: int) -> str
+   Sets the input of a cell as a user would type it: ``"3.5"`` is a number,
+   ``"Hello"`` a string, ``"=A1*2"`` a formula.
 
-      Returns the raw content of a cell. If the cell contains a formula,
-      the returned string starts with ``"="``.
+.. method:: Model.update_cell_with_text(sheet: int, row: int, column: int, value: str)
 
-      :param sheet: The sheet index (0-based).
-      :param row: The 1-based row index.
-      :param column: The 1-based column index.
-      :returns: The raw content, or an empty string if the cell is empty.
+   Sets a string value without input parsing (``"123"`` stays a string).
 
-.. method:: get_cell_type(sheet: int, row: int, column: int) -> PyCellType
+.. method:: Model.update_cell_with_number(sheet: int, row: int, column: int, value: float)
+.. method:: Model.update_cell_with_bool(sheet: int, row: int, column: int, value: bool)
+.. method:: Model.update_cell_with_formula(sheet: int, row: int, column: int, formula: str)
+.. method:: Model.set_user_array_formula(sheet, row, column, width, height, formula: str)
 
-      Returns the type of the cell (number, boolean, string, error, etc.).
+   Sets an array (spill) formula covering ``width`` x ``height`` cells.
 
-      :param sheet: The sheet index (0-based).
-      :param row: The 1-based row index.
-      :param column: The 1-based column index.
-      :rtype: PyCellType
+.. method:: Model.clear_cell_contents(sheet: int, row: int, column: int)
 
-.. method:: get_formatted_cell_value(sheet: int, row: int, column: int) -> str
+   Clears the content of a single cell, keeping the formatting.
 
-      Returns the cell’s value as a formatted string, taking into
-      account any number/currency/date formatting.
+.. method:: Model.range_clear_contents(sheet, start_row, start_column, end_row, end_column)
+.. method:: Model.range_clear_all(sheet, start_row, start_column, end_row, end_column)
 
-      :param sheet: The sheet index (0-based).
-      :param row: The 1-based row index.
-      :param column: The 1-based column index.
-      :returns: Formatted string of the cell’s value.
+Getting values
+^^^^^^^^^^^^^^
 
-.. method:: set_cell_style(sheet: int, row: int, column: int, style: PyStyle)
+.. method:: Model.get_cell_value(sheet: int, row: int, column: int)
 
-      Sets the style of the cell at (sheet, row, column).
+   Returns the value of a cell as a native Python value: ``None``, ``str``,
+   ``float`` or ``bool``.
 
-      :param sheet: The sheet index (0-based).
-      :param row: The 1-based row index.
-      :param column: The 1-based column index.
-      :param style: A PyStyle object specifying the style.
+.. method:: Model.get_cell_value_by_ref(cell_ref: str)
 
-.. method:: get_cell_style(sheet: int, row: int, column: int) -> PyStyle
+   Same, with a reference like ``"Sheet1!C4"``.
 
-      Retrieves the style of the specified cell.
+.. method:: Model.get_formatted_cell_value(sheet: int, row: int, column: int) -> str
 
-      :param sheet: The sheet index (0-based).
-      :param row: The 1-based row index.
-      :param column: The 1-based column index.
-      :returns: A PyStyle object describing the cell’s style.
+   Returns the value formatted with the cell's number format (i.e. ``"$5.75"``).
 
-.. method:: insert_rows(sheet: int, row: int, row_count: int)
+.. method:: Model.get_cell_content(sheet: int, row: int, column: int) -> str
 
-      Inserts new rows.
+   Returns the content as seen in the editor: the formula if there is one, the
+   raw value otherwise.
 
-      :param sheet: The sheet index (0-based).
-      :param row: The position before which new rows are inserted (1-based).
-      :param row_count: The number of rows to insert.
+.. method:: Model.get_cell_formula(sheet: int, row: int, column: int) -> str | None
+.. method:: Model.get_cell_type(sheet: int, row: int, column: int) -> CellType
+.. method:: Model.is_empty_cell(sheet: int, row: int, column: int) -> bool
+.. method:: Model.get_all_cells() -> list[tuple[int, int, int]]
 
-.. method:: insert_columns(sheet: int, column: int, column_count: int)
+   Returns all non-empty cells as ``(sheet, row, column)`` tuples.
 
-      Inserts new columns.
+.. method:: Model.get_sheet_dimensions(sheet: int) -> (int, int, int, int)
 
-      :param sheet: The sheet index (0-based).
-      :param column: The position before which new columns are inserted (1-based).
-      :param column_count: The number of columns to insert.
+   Returns ``(min_row, max_row, min_column, max_column)`` of the non-empty
+   cells; ``(1, 1, 1, 1)`` for an empty sheet.
 
-.. method:: delete_rows(sheet: int, row: int, row_count: int)
+.. method:: Model.get_sheet_markup(sheet: int) -> str
 
-      Deletes a range of rows.
+   Returns a markdown-like table of the sheet (formulas, not values), useful
+   for debugging and tests.
 
-      :param sheet: The sheet index (0-based).
-      :param row: The starting row to delete (1-based).
-      :param row_count: How many rows to delete.
+.. method:: Model.cycle_reference(value: str, start: int, end: int) -> (str, int, int)
 
-.. method:: delete_columns(sheet: int, column: int, column_count: int)
+   Cycles the references touched by the cursor through the four
+   absolute/relative states, Excel F4 style (see :meth:`UserModel.cycle_reference`).
 
-      Deletes a range of columns.
+Styles
+^^^^^^
 
-      :param sheet: The sheet index (0-based).
-      :param column: The starting column to delete (1-based).
-      :param column_count: How many columns to delete.
+Styles are dictionaries; see :doc:`objects`.
 
-.. method:: get_column_width(sheet: int, column: int) -> float
+.. method:: Model.get_cell_style(sheet: int, row: int, column: int) -> dict
+.. method:: Model.set_cell_style(sheet: int, row: int, column: int, style: dict)
+.. method:: Model.get_column_style(sheet: int, column: int) -> dict | None
+.. method:: Model.set_column_style(sheet: int, column: int, style: dict)
+.. method:: Model.delete_column_style(sheet: int, column: int)
+.. method:: Model.get_row_style(sheet: int, row: int) -> dict | None
+.. method:: Model.set_row_style(sheet: int, row: int, style: dict)
+.. method:: Model.delete_row_style(sheet: int, row: int)
 
-      Retrieves the width of a given column.
+Rows and columns
+^^^^^^^^^^^^^^^^
 
-      :param sheet: The sheet index (0-based).
-      :param column: The 1-based column index.
-      :rtype: float
+.. method:: Model.insert_rows(sheet: int, row: int, row_count: int)
+.. method:: Model.insert_columns(sheet: int, column: int, column_count: int)
+.. method:: Model.delete_rows(sheet: int, row: int, row_count: int)
+.. method:: Model.delete_columns(sheet: int, column: int, column_count: int)
+.. method:: Model.get_column_width(sheet: int, column: int) -> float
+.. method:: Model.get_row_height(sheet: int, row: int) -> float
+.. method:: Model.set_column_width(sheet: int, column: int, width: float)
+.. method:: Model.set_row_height(sheet: int, row: int, height: float)
+.. method:: Model.set_column_hidden(sheet: int, column: int, hidden: bool)
+.. method:: Model.set_row_hidden(sheet: int, row: int, hidden: bool)
+.. method:: Model.is_column_hidden(sheet: int, column: int) -> bool
+.. method:: Model.is_row_hidden(sheet: int, row: int) -> bool
+.. method:: Model.get_frozen_rows_count(sheet: int) -> int
+.. method:: Model.get_frozen_columns_count(sheet: int) -> int
+.. method:: Model.set_frozen_rows_count(sheet: int, row_count: int)
+.. method:: Model.set_frozen_columns_count(sheet: int, column_count: int)
 
-.. method:: get_row_height(sheet: int, row: int) -> float
+Sheets
+^^^^^^
 
-      Retrieves the height of a given row.
+.. method:: Model.add_sheet(sheet_name: str)
+.. method:: Model.new_sheet()
 
-      :param sheet: The sheet index (0-based).
-      :param row: The 1-based row index.
-      :rtype: float
+   Adds a sheet with an automatically generated name.
 
-.. method:: set_column_width(sheet: int, column: int, width: float)
+.. method:: Model.delete_sheet(sheet: int)
+.. method:: Model.rename_sheet(sheet: int, new_name: str)
+.. method:: Model.set_sheet_color(sheet: int, color)
 
-      Sets the width of a given column.
+   ``color`` is ``None``, ``"#RRGGBB"`` or ``[theme_index, tint]``.
 
-      :param sheet: The sheet index (0-based).
-      :param column: The 1-based column index.
-      :param width: The desired width (float).
+.. method:: Model.set_sheet_state(sheet: int, state: str)
 
-.. method:: set_row_height(sheet: int, row: int, height: float)
+   ``state`` is ``"visible"``, ``"hidden"`` or ``"veryHidden"``.
 
-      Sets the height of a given row.
+.. method:: Model.get_worksheets_properties() -> list[dict]
+.. method:: Model.set_show_grid_lines(sheet: int, show_grid_lines: bool)
 
-      :param sheet: The sheet index (0-based).
-      :param row: The 1-based row index.
-      :param height: The desired height (float).
+Merged cells
+^^^^^^^^^^^^
 
-.. method:: get_frozen_columns_count(sheet: int) -> int
+.. method:: Model.merge_cells(sheet, start_row, start_column, end_row, end_column)
 
-      Returns the number of columns frozen (pinned) on the left side of the sheet.
+   Merges the range into a single cell anchored at its top-left corner. At
+   most one cell of the range may have content: it moves to the anchor. Fails
+   if the range is a single cell, intersects an existing merged cell or an
+   array formula, or has more than one cell with content.
 
-      :param sheet: The sheet index (0-based).
-      :rtype: int
+.. method:: Model.merge_cells_center(sheet, start_row, start_column, end_row, end_column)
 
-.. method:: get_frozen_rows_count(sheet: int) -> int
+   Same as ``merge_cells`` but also centers the content horizontally
+   ("merge & center").
 
-      Returns the number of rows frozen (pinned) at the top of the sheet.
+.. method:: Model.merge_cells_across(sheet, start_row, start_column, end_row, end_column)
 
-      :param sheet: The sheet index (0-based).
-      :rtype: int
+   Merges each row of the range separately ("merge across"). All-or-nothing.
 
-.. method:: set_frozen_columns_count(sheet: int, column_count: int)
+.. method:: Model.merge_cells_down(sheet, start_row, start_column, end_row, end_column)
 
-      Sets how many columns are frozen (pinned) on the left.
+   Merges each column of the range separately ("merge down"). All-or-nothing.
 
-      :param sheet: The sheet index (0-based).
-      :param column_count: The number of frozen columns (0-based).
+.. method:: Model.unmerge_cells(sheet, start_row, start_column, end_row, end_column)
 
-.. method:: set_frozen_rows_count(sheet: int, row_count: int)
+   Removes every merged cell that intersects the range, keeping the content
+   of the anchors. Unmerging nothing is not an error.
 
-      Sets how many rows are frozen (pinned) at the top.
+.. method:: Model.get_merged_cells(sheet: int) -> list[dict]
 
-      :param sheet: The sheet index (0-based).
-      :param row_count: The number of frozen rows (0-based).
+   One entry per merged cell: ``{"row", "column", "width", "height"}`` where
+   ``(row, column)`` is the anchor cell.
 
-.. method:: get_worksheets_properties() -> List[PySheetProperty]
+Defined names
+^^^^^^^^^^^^^
 
-      Returns a list of :class:`PySheetProperty` describing each worksheet’s
-      name, visibility state, ID, and tab color.
+.. method:: Model.get_defined_name_list() -> list[dict]
+.. method:: Model.new_defined_name(name: str, scope: int | None, formula: str)
+.. method:: Model.update_defined_name(name, scope, new_name, new_scope, new_formula)
+.. method:: Model.delete_defined_name(name: str, scope: int | None)
 
-      :rtype: list of PySheetProperty
+Workbook properties
+^^^^^^^^^^^^^^^^^^^
 
-.. method:: set_sheet_color(sheet: int, color: str)
-
-      Sets the tab color of a sheet. Use an empty string to clear the color.
-
-      :param sheet: The sheet index (0-based).
-      :param color: A color in “#RRGGBB” format, or empty to remove color.
-
-.. method:: add_sheet(sheet_name: str)
-
-      Creates a new sheet with the specified name.
-
-      :param sheet_name: The name to give the new sheet.
-
-.. method:: new_sheet()
-
-      Creates a new sheet with an auto-generated name.
-
-.. method:: delete_sheet(sheet: int)
-
-      Deletes the sheet at the given index.
-
-      :param sheet: The sheet index (0-based).
-
-.. method:: rename_sheet(sheet: int, new_name: str)
-
-      Renames the sheet at the given index.
-
-      :param sheet: The sheet index (0-based).
-      :param new_name: The new sheet name.
-
-.. method:: test_panic()
-
-      A test method that deliberately panics in Rust.
-      Used for testing panic handling at the method level.
-
-      :raises WorkbookError: (wrapped Rust panic)
+.. method:: Model.get_theme() -> dict
+.. method:: Model.set_theme(theme: dict)
+.. method:: Model.get_timezone() -> str
+.. method:: Model.set_timezone(timezone: str)
+.. method:: Model.get_locale() -> str
+.. method:: Model.set_locale(locale: str)
+.. method:: Model.get_language() -> str
+.. method:: Model.set_language(language: str)
+.. method:: Model.get_fmt_settings() -> dict

@@ -1,4 +1,3 @@
-use crate::constants::{LAST_COLUMN, LAST_ROW};
 use crate::expressions::types::CellReferenceIndex;
 use crate::{
     calc_result::CalcResult, expressions::parser::Node, expressions::token::Error, model::Model,
@@ -11,6 +10,7 @@ use super::{
     },
     util::{compare_values, from_wildcard_to_regex, result_matches_regex},
 };
+use crate::types::Position;
 
 #[derive(PartialEq)]
 enum SearchMode {
@@ -118,7 +118,7 @@ fn linear_search(
     None
 }
 
-impl<'a> Model<'a> {
+impl<'a, A: Position> Model<'a, A> {
     /// The XLOOKUP function searches a range or an array, and then returns the item corresponding
     /// to the first match it finds. If no match exists, then XLOOKUP can return the closest (approximate) match.
     /// =XLOOKUP(lookup_value, lookup_array, return_array, [if_not_found], [match_mode], [search_mode])
@@ -216,11 +216,10 @@ impl<'a> Model<'a> {
         // lookup_array
         match self.evaluate_node_in_context(&args[1], cell) {
             CalcResult::Range { left, right } => {
-                let is_row_vector;
-                if left.row == right.row {
-                    is_row_vector = false;
+                let is_row_vector = if left.row == right.row {
+                    false
                 } else if left.column == right.column {
-                    is_row_vector = true;
+                    true
                 } else {
                     // second argument must be a vector
                     return CalcResult::Error {
@@ -228,7 +227,7 @@ impl<'a> Model<'a> {
                         origin: cell,
                         message: "Second argument must be a vector".to_string(),
                     };
-                }
+                };
                 // return array
                 match self.evaluate_node_in_context(&args[2], cell) {
                     CalcResult::Range {
@@ -250,29 +249,14 @@ impl<'a> Model<'a> {
                         let mut column2 = right.column;
                         let column1 = left.column;
 
-                        if row1 == 1 && row2 == LAST_ROW {
-                            row2 = match self.workbook.worksheet(left.sheet) {
-                                Ok(s) => s.dimension().max_row,
-                                Err(_) => {
-                                    return CalcResult::new_error(
-                                        Error::ERROR,
-                                        cell,
-                                        format!("Invalid worksheet index: '{}'", left.sheet),
-                                    );
-                                }
-                            };
-                        }
-                        if column1 == 1 && column2 == LAST_COLUMN {
-                            column2 = match self.workbook.worksheet(left.sheet) {
-                                Ok(s) => s.dimension().max_column,
-                                Err(_) => {
-                                    return CalcResult::new_error(
-                                        Error::ERROR,
-                                        cell,
-                                        format!("Invalid worksheet index: '{}'", left.sheet),
-                                    );
-                                }
-                            };
+                        match self.clip_to_used_area(left.sheet, row1, column1, row2, column2) {
+                            Ok((r, c)) => {
+                                row2 = r;
+                                column2 = c;
+                            }
+                            Err(message) => {
+                                return CalcResult::new_error(Error::ERROR, cell, message)
+                            }
                         }
                         let left = CellReferenceIndex {
                             sheet: left.sheet,

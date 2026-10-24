@@ -1,11 +1,12 @@
 use statrs::distribution::{Continuous, ContinuousCDF, LogNormal};
 
 use crate::expressions::types::CellReferenceIndex;
+use crate::types::Position;
 use crate::{
     calc_result::CalcResult, expressions::parser::Node, expressions::token::Error, model::Model,
 };
 
-impl<'a> Model<'a> {
+impl<'a, A: Position> Model<'a, A> {
     pub(crate) fn fn_log_norm_dist(
         &mut self,
         args: &[Node],
@@ -15,15 +16,15 @@ impl<'a> Model<'a> {
             return CalcResult::new_args_number_error(cell);
         }
 
-        let x = match self.get_number_no_bools(&args[0], cell) {
+        let x = match self.get_number(&args[0], cell) {
             Ok(f) => f,
             Err(e) => return e,
         };
-        let mean = match self.get_number_no_bools(&args[1], cell) {
+        let mean = match self.get_number(&args[1], cell) {
             Ok(f) => f,
             Err(e) => return e,
         };
-        let std_dev = match self.get_number_no_bools(&args[2], cell) {
+        let std_dev = match self.get_number(&args[2], cell) {
             Ok(f) => f,
             Err(e) => return e,
         };
@@ -76,15 +77,15 @@ impl<'a> Model<'a> {
             return CalcResult::new_args_number_error(cell);
         }
 
-        let p = match self.get_number_no_bools(&args[0], cell) {
+        let p = match self.get_number(&args[0], cell) {
             Ok(f) => f,
             Err(e) => return e,
         };
-        let mean = match self.get_number_no_bools(&args[1], cell) {
+        let mean = match self.get_number(&args[1], cell) {
             Ok(f) => f,
             Err(e) => return e,
         };
-        let std_dev = match self.get_number_no_bools(&args[2], cell) {
+        let std_dev = match self.get_number(&args[2], cell) {
             Ok(f) => f,
             Err(e) => return e,
         };

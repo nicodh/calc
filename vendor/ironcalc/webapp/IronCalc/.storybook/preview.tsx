@@ -1,40 +1,18 @@
 import type { Preview } from "@storybook/react";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { I18nextProvider } from "react-i18next";
 import i18n from "../src/i18n";
-import type { PartialIronCalcThemeVariables } from "../src/theme";
-import { defaultThemeVariables, setThemeVariables } from "../src/theme/theme";
+import {
+  darkThemeVariables,
+  defaultThemeVariables,
+  setThemeVariables,
+} from "../src/theme/theme";
 import "../src/theme/theme.css";
 import "../src/index.css";
 
-const crazyThemeVariables: PartialIronCalcThemeVariables = {
-  "--palette-common-black": "#2f1616",
-  "--palette-common-white": "#ecc9c9",
-
-  "--palette-primary-main": "#F2994A",
-  "--palette-primary-light": "#EFAA6D",
-  "--palette-primary-dark": "#D68742",
-  "--palette-primary-contrast-text": "#dccece",
-
-  "--palette-secondary-main": "#2F80ED",
-  "--palette-secondary-light": "#4E92EC",
-  "--palette-secondary-dark": "#2B6EC8",
-  "--palette-secondary-contrast-text": "#272525",
-
-  "--palette-error-main": "#EB5757",
-  "--palette-error-light": "#E77A7A",
-  "--palette-error-dark": "#CB4C4C",
-  "--palette-error-contrast-text": "#272525",
-
-  "--palette-warning-main": "#F2C94C",
-  "--palette-warning-light": "#EED384",
-  "--palette-warning-dark": "#D6B244",
-  "--palette-warning-contrast-text": "#e3e9cf",
-};
-
 const themes = {
   default: defaultThemeVariables,
-  crazy: crazyThemeVariables,
+  dark: darkThemeVariables,
 };
 
 function PreviewProviders({
@@ -47,14 +25,12 @@ function PreviewProviders({
   locale: string;
 }) {
   const [isLoaded, setIsLoaded] = useState(false);
-  const rootRef = useRef<HTMLDivElement>(null);
+  const themeVariables = themes[themeName] ?? themes.default;
 
   useEffect(() => {
-    const themeVariables = themes[themeName];
-    if (rootRef.current && themeVariables) {
-      setThemeVariables(themeVariables, rootRef.current);
-    }
-  }, [themeName]);
+    document.body.style.backgroundColor =
+      themeVariables["--palette-common-white"];
+  }, [themeVariables]);
 
   useEffect(() => {
     async function start() {
@@ -72,7 +48,14 @@ function PreviewProviders({
   }
 
   return (
-    <div ref={rootRef} className="ic-root">
+    <div
+      className="ic-root"
+      ref={(el) => {
+        if (el) {
+          setThemeVariables(themeVariables, el);
+        }
+      }}
+    >
       <I18nextProvider i18n={i18n}>{children}</I18nextProvider>
     </div>
   );
@@ -88,7 +71,7 @@ const preview: Preview = {
         icon: "paintbrush",
         items: [
           { value: "default", title: "Default" },
-          { value: "crazy", title: "Crazy" },
+          { value: "dark", title: "Dark" },
         ],
       },
     },
@@ -109,6 +92,11 @@ const preview: Preview = {
     },
   },
   parameters: {
+    options: {
+      storySort: {
+        order: ["Components", ["Workbook", "*"]],
+      },
+    },
     controls: {
       matchers: {
         color: /(background|color)$/i,

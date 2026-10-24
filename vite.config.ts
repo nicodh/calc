@@ -18,6 +18,11 @@ export default defineConfig({
     // Once we can rely on a released version of IronCalc again, this can
     // be removed.
     exclude: ["@ironcalc/workbook"],
+    // Being excluded, the library is not scanned, so the dependencies it
+    // imports would only be discovered when the first page loads it. Vite then
+    // re-optimizes and reloads every open page, which pulls pages out from
+    // under the tests running in parallel. Pre-bundle them at startup instead.
+    include: ["lucide-react", "i18next", "react-i18next"],
   },
   resolve: {
     // We end up with multiple copies of these dependencies due to the

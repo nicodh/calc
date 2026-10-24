@@ -6,15 +6,19 @@
 //! In IronCalc _all_ formulas are shared and there is a list of shared formulas much like there is a list of shared strings.
 //! In Excel the situation in more nuanced. A shared formula is shared amongst a rage of cells.
 //! The top left cell would be the "mother" cell that would contain the shared formula:
+//! ```xml
 //! <c r="F4" t="str">
 //!    <f t="shared" ref="F4:F8" si="42">A4+C4</f>
 //!    <v>123</v>
 //! </c>
+//! ```
 //! Cells in the range F4:F8 will then link to that formula like so:
+//! ```xml
 //! <c r="F6">
 //!   <f t="shared" si="42"/>
 //!   <v>1</v>
 //! </c>
+//! ```
 //! Formula in F6 would then be 'A6+C6'
 use std::collections::HashMap;
 
@@ -22,11 +26,15 @@ use itertools::Itertools;
 
 use ironcalc_base::{
     expressions::{
-        parser::{static_analysis::StaticResult, stringify::to_excel_string, Node},
+        parser::{
+            static_analysis::StaticResult,
+            stringify::{to_excel_array_formula_string, to_excel_string},
+            Node,
+        },
         types::CellReferenceRC,
         utils::number_to_column,
     },
-    types::{ArrayKind, Cell, FormulaValue, SpillValue, Worksheet},
+    types::{ArrayKind, Cell, FormulaValue, Link, SpillValue, Worksheet},
 };
 
 use crate::export::conditional_formatting::get_conditional_formatting_xml;
@@ -48,6 +56,98 @@ fn get_cell_style_attribute(s: i32) -> String {
     }
 }
 
+/// The links of the worksheet sorted by (row, column) so that both the
+/// `<hyperlinks>` section and the sheet rels assign relationship ids in the
+/// same, deterministic order.
+fn get_sorted_links(worksheet: &Worksheet) -> Vec<((i32, i32), &Link)> {
+    worksheet
+        .links
+        .iter()
+        .map(|(k, v)| (*k, v))
+        .sorted_by_key(|x| x.0)
+        .collect()
+}
+
+/// An external link whose target is `scheme://host/path#location` is exported with the
+/// fragment in the `location` attribute of the `<hyperlink>` element, matching what
+/// Excel does. Returns (target, location).
+fn split_external_target(target: &str) -> (&str, Option<&str>) {
+    match target.split_once('#') {
+        Some((t, location)) => (t, Some(location)),
+        None => (target, None),
+    }
+}
+
+/// The `<hyperlinks>` section of the worksheet or an empty string if there are none.
+/// External links reference a relationship (`rId1`, `rId2`...) in the sheet rels part,
+/// see [`get_worksheet_xml_rels`].
+fn get_hyperlinks_section(worksheet: &Worksheet) -> String {
+    let links = get_sorted_links(worksheet);
+    if links.is_empty() {
+        return "".to_string();
+    }
+    let mut hyperlinks_str: Vec<String> = vec![];
+    let mut rel_id = 0;
+    for ((row, column), link) in links {
+        let column_name = match number_to_column(column) {
+            Some(name) => name,
+            None => continue,
+        };
+        let cell_name = format!("{column_name}{row}");
+        match link {
+            Link::External { target, tooltip } => {
+                rel_id += 1;
+                let location_attribute = match split_external_target(target).1 {
+                    Some(location) => format!(" location=\"{}\"", escape_xml(location)),
+                    None => "".to_string(),
+                };
+                let tooltip_attribute = get_tooltip_attribute(tooltip);
+                hyperlinks_str.push(format!(
+                    "<hyperlink ref=\"{cell_name}\" r:id=\"rId{rel_id}\"{location_attribute}{tooltip_attribute}/>"
+                ));
+            }
+            Link::Internal { location, tooltip } => {
+                let location = escape_xml(location);
+                let tooltip_attribute = get_tooltip_attribute(tooltip);
+                hyperlinks_str.push(format!(
+                    "<hyperlink ref=\"{cell_name}\" location=\"{location}\"{tooltip_attribute}/>"
+                ));
+            }
+        }
+    }
+    format!("<hyperlinks>{}</hyperlinks>", hyperlinks_str.join(""))
+}
+
+fn get_tooltip_attribute(tooltip: &Option<String>) -> String {
+    match tooltip {
+        Some(tooltip) => format!(" tooltip=\"{}\"", escape_xml(tooltip)),
+        None => "".to_string(),
+    }
+}
+
+/// The rels part of the worksheet (`xl/worksheets/_rels/sheetN.xml.rels`) holding one
+/// relationship per external link, or `None` if the worksheet has no external links.
+pub(crate) fn get_worksheet_xml_rels(worksheet: &Worksheet) -> Option<String> {
+    let mut relationships_str: Vec<String> = vec![];
+    let mut rel_id = 0;
+    for (_, link) in get_sorted_links(worksheet) {
+        if let Link::External { target, .. } = link {
+            rel_id += 1;
+            let target = escape_xml(split_external_target(target).0);
+            relationships_str.push(format!(
+                "<Relationship Id=\"rId{rel_id}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink\" Target=\"{target}\" TargetMode=\"External\"/>"
+            ));
+        }
+    }
+    if relationships_str.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{XML_DECLARATION}\n<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">{}</Relationships>",
+        relationships_str.join("")
+    ))
+}
+
 fn get_formula_attribute(
     sheet_name: String,
     row: i32,
@@ -63,9 +163,26 @@ fn get_formula_attribute(
     escape_xml(formula).to_string()
 }
 
+/// The formula of an array, CSE or dynamic. It keeps every implicit
+/// intersection: nothing puts them back when the formula is read again.
+fn get_array_formula_attribute(
+    sheet_name: String,
+    row: i32,
+    column: i32,
+    parsed_formula: &Node,
+) -> String {
+    let cell_ref = CellReferenceRC {
+        sheet: sheet_name,
+        row,
+        column,
+    };
+    let formula = &to_excel_array_formula_string(parsed_formula, &cell_ref);
+    escape_xml(formula).to_string()
+}
+
 pub(crate) fn get_worksheet_xml(
     worksheet: &Worksheet,
-    parsed_formulas: &[(Node, StaticResult)],
+    parsed_formulas: &[(std::sync::Arc<Node>, StaticResult)],
     dimension: &str,
     is_sheet_selected: bool,
 ) -> String {
@@ -103,12 +220,17 @@ pub(crate) fn get_worksheet_xml(
         row_style_dict.insert(row.r, row.clone());
     }
 
-    for (row_index, row_data) in worksheet.sheet_data.iter().sorted_by_key(|x| x.0) {
+    // A row with no cells is still written when it has a height or is hidden.
+    let mut row_indices = worksheet.sheet_data.rows();
+    row_indices.extend(row_style_dict.keys());
+    row_indices.sort_unstable();
+    row_indices.dedup();
+    for row_index in row_indices {
         let mut row_data_str: Vec<String> = vec![];
-        for (column_index, cell) in row_data.iter().sorted_by_key(|x| x.0) {
-            let column_name = number_to_column(*column_index).unwrap();
+        for (column_index, cell) in worksheet.sheet_data.cells_in_row(row_index) {
+            let column_name = number_to_column(column_index).unwrap();
             let cell_name = format!("{column_name}{row_index}");
-            match cell {
+            match &*cell {
                 Cell::EmptyCell { s } => {
                     // they only hold the style
                     let style = get_cell_style_attribute(*s);
@@ -188,8 +310,8 @@ pub(crate) fn get_worksheet_xml(
                     let style = get_cell_style_attribute(*s);
                     let formula = get_formula_attribute(
                         worksheet.get_name(),
-                        *row_index,
-                        *column_index,
+                        row_index,
+                        column_index,
                         &parsed_formulas[*f as usize].0,
                     );
                     let b = i32::from(*v);
@@ -209,8 +331,8 @@ pub(crate) fn get_worksheet_xml(
                     // </c>
                     let formula = get_formula_attribute(
                         worksheet.get_name(),
-                        *row_index,
-                        *column_index,
+                        row_index,
+                        column_index,
                         &parsed_formulas[*f as usize].0,
                     );
                     let style = get_cell_style_attribute(*s);
@@ -229,8 +351,8 @@ pub(crate) fn get_worksheet_xml(
                     // </c>
                     let formula = get_formula_attribute(
                         worksheet.get_name(),
-                        *row_index,
-                        *column_index,
+                        row_index,
+                        column_index,
                         &parsed_formulas[*f as usize].0,
                     );
                     let style = get_cell_style_attribute(*s);
@@ -250,8 +372,8 @@ pub(crate) fn get_worksheet_xml(
                     // </c>
                     let formula = get_formula_attribute(
                         worksheet.get_name(),
-                        *row_index,
-                        *column_index,
+                        row_index,
+                        column_index,
                         &parsed_formulas[*f as usize].0,
                     );
                     let style = get_cell_style_attribute(*s);
@@ -294,14 +416,14 @@ pub(crate) fn get_worksheet_xml(
                         Some(node) => node,
                         None => continue,
                     };
-                    let formula = get_formula_attribute(
+                    let formula = get_array_formula_attribute(
                         worksheet.get_name(),
-                        *row_index,
-                        *column_index,
+                        row_index,
+                        column_index,
                         &node.0,
                     );
                     let style = get_cell_style_attribute(*s);
-                    let range = match get_range_str(*row_index, *column_index, r.0, r.1) {
+                    let range = match get_range_str(row_index, column_index, r.0, r.1) {
                         Some(range) => range,
                         None => continue,
                     };
@@ -334,14 +456,14 @@ pub(crate) fn get_worksheet_xml(
                         Some(node) => node,
                         None => continue,
                     };
-                    let formula = get_formula_attribute(
+                    let formula = get_array_formula_attribute(
                         worksheet.get_name(),
-                        *row_index,
-                        *column_index,
+                        row_index,
+                        column_index,
                         &node.0,
                     );
                     let style = get_cell_style_attribute(*s);
-                    let range = match get_range_str(*row_index, *column_index, r.0, r.1) {
+                    let range = match get_range_str(row_index, column_index, r.0, r.1) {
                         Some(range) => range,
                         None => continue,
                     };
@@ -373,14 +495,14 @@ pub(crate) fn get_worksheet_xml(
                         Some(node) => node,
                         None => continue,
                     };
-                    let formula = get_formula_attribute(
+                    let formula = get_array_formula_attribute(
                         worksheet.get_name(),
-                        *row_index,
-                        *column_index,
+                        row_index,
+                        column_index,
                         &node.0,
                     );
                     let style = get_cell_style_attribute(*s);
-                    let range = match get_range_str(*row_index, *column_index, r.0, r.1) {
+                    let range = match get_range_str(row_index, column_index, r.0, r.1) {
                         Some(range) => range,
                         None => continue,
                     };
@@ -413,14 +535,14 @@ pub(crate) fn get_worksheet_xml(
                         Some(node) => node,
                         None => continue,
                     };
-                    let formula = get_formula_attribute(
+                    let formula = get_array_formula_attribute(
                         worksheet.get_name(),
-                        *row_index,
-                        *column_index,
+                        row_index,
+                        column_index,
                         &node.0,
                     );
                     let style = get_cell_style_attribute(*s);
-                    let range = match get_range_str(*row_index, *column_index, r.0, r.1) {
+                    let range = match get_range_str(row_index, column_index, r.0, r.1) {
                         Some(range) => range,
                         None => continue,
                     };
@@ -435,7 +557,7 @@ pub(crate) fn get_worksheet_xml(
                 }
             }
         }
-        let row_style_str = match row_style_dict.get(row_index) {
+        let row_style_str = match row_style_dict.get(&row_index) {
             Some(row_style) => {
                 let hidden_str = if row_style.hidden {
                     r#" hidden="1""#
@@ -460,8 +582,14 @@ pub(crate) fn get_worksheet_xml(
     }
     let sheet_data = sheet_data_str.join("");
 
-    for merge_cell_ref in &worksheet.merge_cells {
-        merged_cells_str.push(format!("<mergeCell ref=\"{merge_cell_ref}\"/>"))
+    for merged_cell in &worksheet.merged_cells {
+        let first_column = number_to_column(merged_cell.column).unwrap_or("A".to_string());
+        let last_column = number_to_column(merged_cell.last_column()).unwrap_or("A".to_string());
+        merged_cells_str.push(format!(
+            "<mergeCell ref=\"{first_column}{}:{last_column}{}\"/>",
+            merged_cell.row,
+            merged_cell.last_row()
+        ))
     }
     let merged_cells_count = merged_cells_str.len();
 
@@ -484,25 +612,9 @@ pub(crate) fn get_worksheet_xml(
         ""
     };
 
-    let mut active_cell = "A1".to_string();
-    let mut sqref = "A1".to_string();
-
-    let views = &worksheet.views;
-    if let Some(view) = views.get(&0) {
-        let range = view.range;
-        let row = view.row;
-        let column = view.column;
-        let column_name = number_to_column(column).unwrap_or("A".to_string());
-        active_cell = format!("{column_name}{row}");
-
-        let column_start = number_to_column(range[1]).unwrap_or("A".to_string());
-        let column_end = number_to_column(range[3]).unwrap_or("A".to_string());
-        if range[0] == range[2] && range[1] == range[3] {
-            sqref = format!("{column_start}{}", range[0]);
-        } else {
-            sqref = format!("{}{}:{}{}", column_start, range[0], column_end, range[2]);
-        }
-    }
+    // IronCalc does not keep track of the selection: it is always A1.
+    let active_cell = "A1";
+    let sqref = "A1";
 
     let merge_cells_section = if merged_cells_count > 0 {
         format!(
@@ -557,6 +669,8 @@ pub(crate) fn get_worksheet_xml(
     let (cf_sections, cf_ext_lst) =
         get_conditional_formatting_xml(&worksheet.conditional_formatting);
 
+    let hyperlinks_section = get_hyperlinks_section(worksheet);
+
     format!(
         "{XML_DECLARATION}\
 <worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">\
@@ -572,6 +686,7 @@ pub(crate) fn get_worksheet_xml(
   </sheetData>\
   {merge_cells_section}\
   {cf_sections}\
+  {hyperlinks_section}\
   {cf_ext_lst}\
 </worksheet>"
     )

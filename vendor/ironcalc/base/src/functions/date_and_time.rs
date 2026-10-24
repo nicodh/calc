@@ -13,6 +13,81 @@ fn is_leap_year(year: i32) -> bool {
     (year % 4 == 0) && (year % 100 != 0 || year % 400 == 0)
 }
 
+fn last_day_of_feb(year: i32) -> u32 {
+    if is_leap_year(year) {
+        29
+    } else {
+        28
+    }
+}
+
+// Maps a date serial number (date part only) to the Excel (year, month, day) it
+// represents, replicating Excel's fictional 29 February 1900 (the "1900
+// leap-year bug") so DAYS360 matches Excel for early-1900 serials. Returns
+// `None` when the serial is outside `0..=MAXIMUM_DATE_SERIAL_NUMBER`, which Excel
+// reports as `#NUM!`.
+fn excel_serial_to_ymd(serial: i64) -> Option<(i32, u32, u32)> {
+    if !(0..=MAXIMUM_DATE_SERIAL_NUMBER as i64).contains(&serial) {
+        return None;
+    }
+    // Excel renders serial 0 as "0 January 1900"; DAYS360 reads it as day 0 of
+    // January 1900 (not 31 December 1899), which is what makes it antisymmetric.
+    if serial == 0 {
+        return Some((1900, 1, 0));
+    }
+    // Excel's non-existent 29 February 1900 (serial 60).
+    if serial == 60 {
+        return Some((1900, 2, 29));
+    }
+    let date = if serial < 60 {
+        // Below the fictional leap day Excel counts serial 1 as 1900-01-01, so
+        // serial N is N days after 1899-12-31 (serial 0).
+        let base = chrono::NaiveDate::from_ymd_opt(1899, 12, 31)?;
+        base + chrono::Duration::days(serial)
+    } else {
+        // From 1900-03-01 (serial 61) onwards IronCalc's serials match Excel.
+        from_excel_date(serial).ok()?
+    };
+    Some((date.year(), date.month(), date.day()))
+}
+
+// Converts a raw numeric argument to a date serial (date part) for DAYS360,
+// rounding the time-of-day to the nearest second before discarding it. Excel
+// rolls e.g. 46000.999999 up to 46001 when extracting the date part.
+fn days360_serial(raw: f64) -> i64 {
+    ((raw * SECONDS_PER_DAY_F64).round() / SECONDS_PER_DAY_F64).floor() as i64
+}
+
+// Days d1→d2 via the US (NASD) 30/360 convention, as used by the worksheet
+// DAYS360 function. Note this differs from the bond 30/360 (`days_30_360_us`):
+// DAYS360 only promotes the *start* date when it is the last day of February,
+// and never adjusts the end date for February (it touches the end date only
+// when its day-of-month is literally 31).
+fn days360_us(start: (i32, u32, u32), end: (i32, u32, u32)) -> f64 {
+    let (y1, m1, day1) = start;
+    let (y2, m2, day2) = end;
+    let mut day1 = day1 as i32;
+    let mut day2 = day2 as i32;
+
+    if day1 == 31 || (m1 == 2 && day1 == last_day_of_feb(y1) as i32) {
+        day1 = 30;
+    }
+    if day2 == 31 && day1 == 30 {
+        day2 = 30;
+    }
+    (360 * (y2 - y1) + 30 * (m2 as i32 - m1 as i32) + (day2 - day1)) as f64
+}
+
+// Days d1→d2 via the European 30/360 convention used by DAYS360 (method = TRUE):
+// any day-of-month equal to 31 becomes 30, with no February handling.
+fn days360_eu(start: (i32, u32, u32), end: (i32, u32, u32)) -> f64 {
+    let (y1, m1, day1) = start;
+    let (y2, m2, day2) = end;
+    let day1 = (day1 as i32).min(30);
+    let day2 = (day2 as i32).min(30);
+    (360 * (y2 - y1) + 30 * (m2 as i32 - m1 as i32) + (day2 - day1)) as f64
+}
+
 /// Maps a date to the WEEKDAY number for the given `return_type`.
 /// Returns `Error::VALUE`/`Error::NUM` for an invalid `return_type`.
 fn weekday_number(date: chrono::NaiveDate, return_type: i32) -> Result<f64, Error> {
@@ -26,26 +101,36 @@ fn weekday_number(date: chrono::NaiveDate, return_type: i32) -> Result<f64, Erro
             let zero_based = weekday.number_from_monday() - 1; // 0..6, Monday = 0
             ((zero_based + 7 - start) % 7) + 1
         }
-        0 => return Err(Error::VALUE),
         _ => return Err(Error::NUM),
     };
     Ok(num as f64)
 }
 
-fn is_feb_29_between_dates(start: chrono::NaiveDate, end: chrono::NaiveDate) -> bool {
-    let start_year = start.year();
-    let end_year = end.year();
-
-    for year in start_year..=end_year {
-        if is_leap_year(year)
-            && (year < end_year
-                || (year == end_year && end.month() > 2)
-                    && (year > start_year || (year == start_year && start.month() <= 2)))
-        {
-            return true;
+// Port of `isFeb29BetweenConsecutiveYears` from ExcelFinancialFunctions. Only
+// called for dates at most one year apart (`y1 == y2` or `y2 == y1 + 1`).
+fn is_feb29_between_consecutive_years(start: chrono::NaiveDate, end: chrono::NaiveDate) -> bool {
+    let (y1, m1) = (start.year(), start.month());
+    let (y2, m2) = (end.year(), end.month());
+    if y1 == y2 {
+        is_leap_year(y1) && m1 <= 2 && m2 > 2
+    } else if y2 == y1 + 1 {
+        if is_leap_year(y1) {
+            m1 <= 2
+        } else if is_leap_year(y2) {
+            m2 > 2
+        } else {
+            false
         }
+    } else {
+        false
     }
-    false
+}
+
+// The time of day of a serial in whole seconds, after rounding it to the
+// nearest millisecond (0..=86399; a time that rounds up to midnight is 0).
+fn seconds_of_day(v: f64) -> i64 {
+    let ms = (v.rem_euclid(1.0) * SECONDS_PER_DAY_F64 * 1000.0).round() as i64;
+    (ms % (SECONDS_PER_DAY as i64 * 1000)) / 1000
 }
 
 // ---------------------------------------------------------------------------
@@ -101,14 +186,15 @@ macro_rules! time_part_fn {
     };
 }
 
-use crate::arithmetic::bcast_idx;
+use crate::arithmetic::{array_of_errors, bcast_idx};
+use crate::cast::NumberOrArray;
 use crate::constants::MAXIMUM_DATE_SERIAL_NUMBER;
 use crate::constants::MINIMUM_DATE_SERIAL_NUMBER;
 use crate::expressions::types::CellReferenceIndex;
 use crate::formatter::dates::date_to_serial_number;
 use crate::formatter::dates::permissive_date_to_serial_number;
 use crate::formatter::dates::DATE_OUT_OF_RANGE_MESSAGE;
-use crate::number_format::to_precision;
+use crate::types::Position;
 use crate::{
     calc_result::CalcResult,
     constants::EXCEL_DATE_BASE,
@@ -180,14 +266,19 @@ impl WeekendPattern {
     }
 }
 
-fn parse_time_string(text: &str) -> Option<f64> {
-    let text = text.trim();
+// Fraction of a day for a parsed time. The sub-second part is kept, so that
+// TIMEVALUE("4:35:00.5") returns the same value as Excel instead of
+// truncating to the whole second.
+fn time_to_fraction(time: NaiveTime) -> f64 {
+    let seconds = time.num_seconds_from_midnight() as f64 + time.nanosecond() as f64 / 1e9;
+    seconds / SECONDS_PER_DAY_F64
+}
 
-    // First, try custom parsing for edge cases like "24:00:00", "23:60:00", "23:59:60"
-    // that need normalization to match Excel behavior
-    if let Some(time_fraction) = parse_time_with_normalization(text) {
-        return Some(time_fraction);
-    }
+/// The fraction of the day of a text that is a time and nothing else:
+/// "12:00", "6:35:10", "3:30 PM", "5 pm". This is the text that counts as a
+/// number when one is expected: `="12:00"+0` is 0.5.
+pub(crate) fn parse_time_of_day(text: &str) -> Option<f64> {
+    let text = text.trim();
 
     // First, try manual parsing for simple "N PM" / "N AM" format (case-insensitive)
     if let Some((hour_str, is_pm)) = parse_simple_am_pm(text) {
@@ -205,48 +296,112 @@ fn parse_time_string(text: &str) -> Option<f64> {
                     hour
                 };
                 let time = NaiveTime::from_hms_opt(hour_24, 0, 0)?;
-                return Some(time.num_seconds_from_midnight() as f64 / SECONDS_PER_DAY_F64);
+                return Some(time_to_fraction(time));
             }
         }
     }
 
-    // Standard patterns
-    let patterns_time = ["%H:%M:%S", "%H:%M", "%I:%M %p", "%I %p", "%I:%M:%S %p"];
+    // Standard patterns. `%.f` makes the fractional part of the seconds
+    // optional and consumes it when present, so each `%S` pattern is paired
+    // with a `%.f` variant rather than being replaced.
+    let patterns_time = [
+        "%H:%M:%S%.f",
+        "%H:%M:%S",
+        "%H:%M",
+        "%I:%M %p",
+        "%I %p",
+        "%I:%M:%S%.f %p",
+        "%I:%M:%S %p",
+    ];
     for p in patterns_time {
         if let Ok(t) = NaiveTime::parse_from_str(text, p) {
-            return Some(t.num_seconds_from_midnight() as f64 / SECONDS_PER_DAY_F64);
+            return Some(time_to_fraction(t));
         }
+    }
+    None
+}
+
+/// Removes the whitespace directly before and after any of the `separators`
+/// and keeps every other space, like Excel does: "2026 - 01 - 01 12:00"
+/// becomes "2026-01-01 12:00" and "3 : 30 PM" becomes "3:30 PM".
+/// Each whitespace run is decided once, when the next non-whitespace character
+/// is reached, so the cost is linear in the length of the text.
+fn squeeze_separator_spaces(text: &str, separators: &[char]) -> String {
+    let mut result = String::with_capacity(text.len());
+    // Byte offset in `text` where the current whitespace run started
+    let mut run_start: Option<usize> = None;
+    for (idx, c) in text.char_indices() {
+        if c.is_ascii_whitespace() {
+            run_start.get_or_insert(idx);
+            continue;
+        }
+        if let Some(start) = run_start.take() {
+            let after_separator = result.ends_with(separators);
+            if !after_separator && !separators.contains(&c) {
+                result.push_str(&text[start..idx]);
+            }
+        }
+        result.push(c);
+    }
+    if let Some(start) = run_start {
+        if !result.ends_with(separators) {
+            result.push_str(&text[start..]);
+        }
+    }
+    result
+}
+
+fn parse_time_string(text: &str) -> Option<f64> {
+    let text = squeeze_separator_spaces(text.trim(), &[':']);
+    let text = text.as_str();
+
+    // First, try custom parsing for edge cases like "24:00:00", "23:60:00", "23:59:60"
+    // that need normalization to match Excel behavior
+    if let Some(time_fraction) = parse_time_with_normalization(text) {
+        return Some(time_fraction);
+    }
+
+    if let Some(time_fraction) = parse_time_of_day(text) {
+        return Some(time_fraction);
     }
 
     let patterns_dt = [
         // ISO formats
+        "%Y-%m-%d %H:%M:%S%.f",
         "%Y-%m-%d %H:%M:%S",
         "%Y-%m-%d %H:%M",
+        "%Y-%m-%dT%H:%M:%S%.f",
         "%Y-%m-%dT%H:%M:%S",
         "%Y-%m-%dT%H:%M",
         // Excel-style date formats with AM/PM
-        "%d-%b-%Y %I:%M:%S %p", // "22-Aug-2011 6:35:00 AM"
-        "%d-%b-%Y %I:%M %p",    // "22-Aug-2011 6:35 AM"
-        "%d-%b-%Y %H:%M:%S",    // "22-Aug-2011 06:35:00"
-        "%d-%b-%Y %H:%M",       // "22-Aug-2011 06:35"
+        "%d-%b-%Y %I:%M:%S%.f %p", // "22-Aug-2011 6:35:00.5 AM"
+        "%d-%b-%Y %I:%M:%S %p",    // "22-Aug-2011 6:35:00 AM"
+        "%d-%b-%Y %I:%M %p",       // "22-Aug-2011 6:35 AM"
+        "%d-%b-%Y %H:%M:%S%.f",    // "22-Aug-2011 06:35:00.5"
+        "%d-%b-%Y %H:%M:%S",       // "22-Aug-2011 06:35:00"
+        "%d-%b-%Y %H:%M",          // "22-Aug-2011 06:35"
         // US date formats with AM/PM
-        "%m/%d/%Y %I:%M:%S %p", // "8/22/2011 6:35:00 AM"
-        "%m/%d/%Y %I:%M %p",    // "8/22/2011 6:35 AM"
-        "%m/%d/%Y %H:%M:%S",    // "8/22/2011 06:35:00"
-        "%m/%d/%Y %H:%M",       // "8/22/2011 06:35"
+        "%m/%d/%Y %I:%M:%S%.f %p", // "8/22/2011 6:35:00.5 AM"
+        "%m/%d/%Y %I:%M:%S %p",    // "8/22/2011 6:35:00 AM"
+        "%m/%d/%Y %I:%M %p",       // "8/22/2011 6:35 AM"
+        "%m/%d/%Y %H:%M:%S%.f",    // "8/22/2011 06:35:00.5"
+        "%m/%d/%Y %H:%M:%S",       // "8/22/2011 06:35:00"
+        "%m/%d/%Y %H:%M",          // "8/22/2011 06:35"
         // European date formats with AM/PM
-        "%d/%m/%Y %I:%M:%S %p", // "22/8/2011 6:35:00 AM"
-        "%d/%m/%Y %I:%M %p",    // "22/8/2011 6:35 AM"
-        "%d/%m/%Y %H:%M:%S",    // "22/8/2011 06:35:00"
-        "%d/%m/%Y %H:%M",       // "22/8/2011 06:35"
+        "%d/%m/%Y %I:%M:%S%.f %p", // "22/8/2011 6:35:00.5 AM"
+        "%d/%m/%Y %I:%M:%S %p",    // "22/8/2011 6:35:00 AM"
+        "%d/%m/%Y %I:%M %p",       // "22/8/2011 6:35 AM"
+        "%d/%m/%Y %H:%M:%S%.f",    // "22/8/2011 06:35:00.5"
+        "%d/%m/%Y %H:%M:%S",       // "22/8/2011 06:35:00"
+        "%d/%m/%Y %H:%M",          // "22/8/2011 06:35"
     ];
     for p in patterns_dt {
         if let Ok(dt) = NaiveDateTime::parse_from_str(text, p) {
-            return Some(dt.time().num_seconds_from_midnight() as f64 / SECONDS_PER_DAY_F64);
+            return Some(time_to_fraction(dt.time()));
         }
     }
     if let Ok(dt) = DateTime::parse_from_rfc3339(text) {
-        return Some(dt.time().num_seconds_from_midnight() as f64 / SECONDS_PER_DAY_F64);
+        return Some(time_to_fraction(dt.time()));
     }
     None
 }
@@ -282,7 +437,7 @@ fn parse_time_with_normalization(text: &str) -> Option<f64> {
     None
 }
 
-// Normalize time components with overflow handling (like Excel)
+// Normalize time components with overflow handling
 fn normalize_time_components(hour: i32, minute: i32, second: i32) -> f64 {
     // Convert everything to total seconds
     let mut total_seconds = hour * 3600 + minute * 60 + second;
@@ -425,15 +580,47 @@ fn parse_year_simple(year_str: &str) -> Result<i32, String> {
     }
 }
 
-fn parse_datevalue_text(value: &str) -> Result<i32, String> {
-    // Trim whitespace and discard any time component (e.g., "2024-02-29 06:00" -> "2024-02-29")
-    let mut date_str = value.trim();
+// Returns the whole days in a "H:M", "H:M:S" or "H:M:S.f" time part, so that
+// "24:00:00" rolls a date over to the next day like Excel does. Anything else is 0.
+fn whole_days_in_time(time: &str) -> i32 {
+    let time = squeeze_separator_spaces(time.trim(), &[':']);
+    let parts: Vec<&str> = time.split(':').collect();
+    if parts.len() < 2 || parts.len() > 3 {
+        return 0;
+    }
+    let is_integer = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit());
+    if !is_integer(parts[0]) || !is_integer(parts[1]) {
+        return 0;
+    }
+    let (Ok(hours), Ok(minutes)) = (parts[0].parse::<f64>(), parts[1].parse::<f64>()) else {
+        return 0;
+    };
+    let seconds = match parts.get(2) {
+        Some(s) => match s.parse::<f64>() {
+            Ok(v) if v >= 0.0 && s.chars().all(|c| c.is_ascii_digit() || c == '.') => v,
+            _ => return 0,
+        },
+        None => 0.0,
+    };
+    let total_seconds = hours * 3600.0 + minutes * 60.0 + seconds;
+    (total_seconds / 86400.0).floor().min(i32::MAX as f64) as i32
+}
+
+pub(crate) fn parse_datevalue_text(value: &str) -> Result<i32, String> {
+    // Trim whitespace and split off any time component (e.g., "2024-02-29 06:00" -> "2024-02-29").
+    // The time component only counts through its whole days (e.g., "24:00:00" is the next day).
+    let squeezed = squeeze_separator_spaces(value.trim(), &['/', '-']);
+    let mut date_str = squeezed.as_str();
+    let mut time_str = "";
     if let Some(idx) = date_str.find('T') {
+        time_str = &date_str[idx + 1..];
         date_str = &date_str[..idx];
     }
     if let Some(idx) = date_str.find(' ') {
+        time_str = &date_str[idx + 1..];
         date_str = &date_str[..idx];
     }
+    let extra_days = whole_days_in_time(time_str);
 
     let separator = if date_str.contains('/') {
         '/'
@@ -458,6 +645,7 @@ fn parse_datevalue_text(value: &str) -> Result<i32, String> {
     }
 
     let year_str = parts[year_idx];
+    let year_is_first = year_idx == 0;
     // Remove the year from the remaining vector to process day / month.
     parts.remove(year_idx);
     let part1 = parts[0];
@@ -467,7 +655,10 @@ fn parse_datevalue_text(value: &str) -> Result<i32, String> {
     let is_numeric = |s: &str| s.chars().all(char::is_numeric);
 
     // Determine month and day.
-    let (month_str, day_str) = if !is_numeric(part1) {
+    let (month_str, day_str) = if year_is_first {
+        // Year-first dates use the unambiguous YYYY-MM-DD order.
+        (part1, part2)
+    } else if !is_numeric(part1) {
         // textual month in first
         (part1, part2)
     } else if !is_numeric(part2) {
@@ -494,12 +685,19 @@ fn parse_datevalue_text(value: &str) -> Result<i32, String> {
     }
 
     match date_to_serial_number(day, month, year) {
-        Ok(n) => Ok(n),
+        Ok(n) => {
+            let n = n.saturating_add(extra_days);
+            if !(MINIMUM_DATE_SERIAL_NUMBER..=MAXIMUM_DATE_SERIAL_NUMBER).contains(&n) {
+                Err("Not a valid date".to_string())
+            } else {
+                Ok(n)
+            }
+        }
         Err(_) => Err("Not a valid date".to_string()),
     }
 }
 
-impl<'a> Model<'a> {
+impl<'a, A: Position> Model<'a, A> {
     fn get_date_serial(
         &mut self,
         node: &Node,
@@ -550,7 +748,7 @@ impl<'a> Model<'a> {
         if args_count != 2 {
             return CalcResult::new_args_number_error(cell);
         }
-        let serial_number = match self.get_number(&args[0], cell) {
+        let serial_number = match self.get_number_no_bools(&args[0], cell) {
             Ok(c) => {
                 let t = c.floor() as i64;
                 if t < 0 {
@@ -579,6 +777,15 @@ impl<'a> Model<'a> {
         let months = match self.get_number_no_bools(&args[1], cell) {
             Ok(c) => {
                 let t = c.trunc();
+                // Reject months that cannot be represented as i32 — Excel returns #NUM!
+                // for these, and casting would saturate then panic in chrono's Add<Months>.
+                if !t.is_finite() || t > i32::MAX as f64 || t < i32::MIN as f64 {
+                    return CalcResult::Error {
+                        error: Error::NUM,
+                        origin: cell,
+                        message: "EOMONTH out of bounds".to_string(),
+                    };
+                }
                 t as i32
             }
             Err(s) => return s,
@@ -587,9 +794,19 @@ impl<'a> Model<'a> {
         let months_abs = months.unsigned_abs();
 
         let native_date = if months > 0 {
-            date + Months::new(months_abs)
+            date.checked_add_months(Months::new(months_abs))
         } else {
-            date - Months::new(months_abs)
+            date.checked_sub_months(Months::new(months_abs))
+        };
+        let native_date = match native_date {
+            Some(d) => d,
+            None => {
+                return CalcResult::Error {
+                    error: Error::NUM,
+                    origin: cell,
+                    message: "EOMONTH out of bounds".to_string(),
+                };
+            }
         };
 
         // Instead of calculating the end of month we compute the first day of the following month
@@ -601,7 +818,17 @@ impl<'a> Model<'a> {
             year += 1;
         }
         match date_to_serial_number(1, month, year) {
-            Ok(serial_number) => CalcResult::Number(serial_number as f64 - 1.0),
+            Ok(serial_number) => {
+                let end = serial_number - 1;
+                if !(MINIMUM_DATE_SERIAL_NUMBER..=MAXIMUM_DATE_SERIAL_NUMBER).contains(&end) {
+                    return CalcResult::Error {
+                        error: Error::NUM,
+                        origin: cell,
+                        message: "EOMONTH out of bounds".to_string(),
+                    };
+                }
+                CalcResult::Number(end as f64)
+            }
             Err(message) => CalcResult::Error {
                 error: Error::NUM,
                 origin: cell,
@@ -615,25 +842,42 @@ impl<'a> Model<'a> {
         if args.len() != 3 {
             return CalcResult::new_args_number_error(cell);
         }
-        use crate::cast::NumberOrArray;
-
-        let year_na = match self.get_number_or_array(&args[0], cell) {
+        let year_na = self.get_number_or_array(&args[0], cell);
+        let month_na = self.get_number_or_array(&args[1], cell);
+        let day_na = self.get_number_or_array(&args[2], cell);
+        // An argument that is an error is the result, unless another one is
+        // an array: then it is broadcast and every element is an error.
+        let any_array = [&year_na, &month_na, &day_na]
+            .iter()
+            .any(|na| matches!(na, Ok(NumberOrArray::Array(_))));
+        let broadcast_error = |na: Result<NumberOrArray, CalcResult>| match na {
+            Err(CalcResult::Error { error, .. }) if any_array => {
+                Ok(NumberOrArray::Array(vec![vec![ArrayNode::Error(error)]]))
+            }
+            other => other,
+        };
+        let year_na = match broadcast_error(year_na) {
             Ok(v) => v,
             Err(e) => return e,
         };
-        let month_na = match self.get_number_or_array(&args[1], cell) {
+        let month_na = match broadcast_error(month_na) {
             Ok(v) => v,
             Err(e) => return e,
         };
-        let day_na = match self.get_number_or_array(&args[2], cell) {
+        let day_na = match broadcast_error(day_na) {
             Ok(v) => v,
             Err(e) => return e,
         };
 
         fn date_node(year_f: f64, month_f: f64, day_f: f64) -> ArrayNode {
-            let year = year_f.floor() as i32;
+            let mut year = year_f.floor() as i32;
             if year < 0 {
                 return ArrayNode::Error(Error::NUM);
+            }
+            // Excel: a year between 0 and 1899 (inclusive) is treated as an
+            // offset from 1900, e.g. DATE(100, 1, 1) is 2000-01-01
+            if year < 1900 {
+                year += 1900;
             }
             match permissive_date_to_serial_number(
                 day_f.floor() as i32,
@@ -724,7 +968,7 @@ impl<'a> Model<'a> {
         if args_count != 2 {
             return CalcResult::new_args_number_error(cell);
         }
-        let serial_number = match self.get_number(&args[0], cell) {
+        let serial_number = match self.get_number_no_bools(&args[0], cell) {
             Ok(c) => c.floor() as i64,
             Err(s) => return s,
         };
@@ -732,7 +976,7 @@ impl<'a> Model<'a> {
             Ok(d) => d,
             Err(e) => return e,
         };
-        let months = match self.get_number(&args[1], cell) {
+        let months = match self.get_number_no_bools(&args[1], cell) {
             Ok(c) => {
                 let t = c.trunc();
                 t as i32
@@ -749,7 +993,7 @@ impl<'a> Model<'a> {
         };
 
         let serial_number = native_date.num_days_from_ce() - EXCEL_DATE_BASE;
-        if serial_number < MINIMUM_DATE_SERIAL_NUMBER {
+        if !(MINIMUM_DATE_SERIAL_NUMBER..=MAXIMUM_DATE_SERIAL_NUMBER).contains(&serial_number) {
             return CalcResult::Error {
                 error: Error::NUM,
                 origin: cell,
@@ -868,11 +1112,11 @@ impl<'a> Model<'a> {
         if !(2..=3).contains(&args.len()) {
             return CalcResult::new_args_number_error(cell);
         }
-        let start_serial = match self.get_number(&args[0], cell) {
+        let start_serial = match self.get_number_no_bools(&args[0], cell) {
             Ok(n) => n.floor() as i64,
             Err(e) => return e,
         };
-        let end_serial = match self.get_number(&args[1], cell) {
+        let end_serial = match self.get_number_no_bools(&args[1], cell) {
             Ok(n) => n.floor() as i64,
             Err(e) => return e,
         };
@@ -1008,11 +1252,11 @@ impl<'a> Model<'a> {
         if !(2..=4).contains(&args.len()) {
             return CalcResult::new_args_number_error(cell);
         }
-        let start_serial = match self.get_number(&args[0], cell) {
+        let start_serial = match self.get_number_no_bools(&args[0], cell) {
             Ok(n) => n.floor() as i64,
             Err(e) => return e,
         };
-        let end_serial = match self.get_number(&args[1], cell) {
+        let end_serial = match self.get_number_no_bools(&args[1], cell) {
             Ok(n) => n.floor() as i64,
             Err(e) => return e,
         };
@@ -1074,7 +1318,7 @@ impl<'a> Model<'a> {
                         return CalcResult::Error {
                             error: Error::VALUE,
                             origin: cell,
-                            message: format!("Invalid timezone: {}", &tz_str),
+                            message: format!("Invalid timezone: {}", tz_str),
                         }
                     }
                 };
@@ -1114,7 +1358,7 @@ impl<'a> Model<'a> {
                         return CalcResult::Error {
                             error: Error::VALUE,
                             origin: cell,
-                            message: format!("Invalid timezone: {}", &tz_str),
+                            message: format!("Invalid timezone: {}", tz_str),
                         }
                     }
                 };
@@ -1165,14 +1409,11 @@ impl<'a> Model<'a> {
     // -----------------------------------------------------------------------
 
     time_part_fn!(fn_hour, |v: f64| (v.rem_euclid(1.0) * 24.0).floor());
-    time_part_fn!(fn_minute, |v: f64| {
-        let total_seconds = (v.rem_euclid(1.0) * SECONDS_PER_DAY_F64).floor();
-        ((total_seconds / 60.0) as i64 % 60) as f64
-    });
-    time_part_fn!(fn_second, |v: f64| {
-        let total_seconds = to_precision(v.rem_euclid(1.0) * SECONDS_PER_DAY_F64, 15).floor();
-        (total_seconds as i64 % 60) as f64
-    });
+    // MINUTE and SECOND round the time of day to the nearest millisecond
+    // before taking it apart, as Excel does: MINUTE(0.520833333) is 30
+    // (12:29:59.99997 is 12:30:00.000), SECOND(TIME(14,30,45.999)) stays 45.
+    time_part_fn!(fn_minute, |v: f64| ((seconds_of_day(v) / 60) % 60) as f64);
+    time_part_fn!(fn_second, |v: f64| (seconds_of_day(v) % 60) as f64);
 
     pub(crate) fn fn_timevalue(&mut self, args: &[Node], cell: CellReferenceIndex) -> CalcResult {
         if args.len() != 1 {
@@ -1205,14 +1446,16 @@ impl<'a> Model<'a> {
                     message: "Invalid date".to_string(),
                 },
             },
-            CalcResult::Number(f) => CalcResult::Number(f.floor()),
-            CalcResult::Boolean(b) => {
-                if b {
-                    CalcResult::Number(1.0)
-                } else {
-                    CalcResult::Number(0.0)
-                }
-            }
+            CalcResult::Number(_) => CalcResult::Error {
+                error: Error::VALUE,
+                origin: cell,
+                message: "Invalid date".to_string(),
+            },
+            CalcResult::Boolean(_) => CalcResult::Error {
+                error: Error::VALUE,
+                origin: cell,
+                message: "Invalid date".to_string(),
+            },
             err @ CalcResult::Error { .. } => err,
             CalcResult::Range { .. } | CalcResult::Array(_) | CalcResult::Lambda(_) => {
                 CalcResult::Error {
@@ -1221,7 +1464,11 @@ impl<'a> Model<'a> {
                     message: "Arrays not supported yet".to_string(),
                 }
             }
-            CalcResult::EmptyCell | CalcResult::EmptyArg => CalcResult::Number(0.0),
+            CalcResult::EmptyCell | CalcResult::EmptyArg => CalcResult::Error {
+                error: Error::VALUE,
+                origin: cell,
+                message: "Invalid date".to_string(),
+            },
         }
     }
 
@@ -1369,14 +1616,17 @@ impl<'a> Model<'a> {
             Ok(c) => c.floor() as i64,
             Err(s) => return s,
         };
-        match self.excel_date(start_serial, cell) {
-            Ok(d) => d,
-            Err(e) => return e,
-        };
-        match self.excel_date(end_serial, cell) {
-            Ok(d) => d,
-            Err(e) => return e,
-        };
+        // Excel accepts any serial in 0..=MAXIMUM (a 0 serial is 1900-01-00) and
+        // reports #NUM! otherwise. DAYS works directly on serials, so the dates
+        // themselves are never materialised.
+        let range = 0..=MAXIMUM_DATE_SERIAL_NUMBER as i64;
+        if !range.contains(&start_serial) || !range.contains(&end_serial) {
+            return CalcResult::new_error(
+                Error::NUM,
+                cell,
+                "Out of range parameters for date".to_string(),
+            );
+        }
         CalcResult::Number((end_serial - start_serial) as f64)
     }
 
@@ -1385,82 +1635,82 @@ impl<'a> Model<'a> {
             return CalcResult::new_args_number_error(cell);
         }
         let start_serial = match self.get_number(&args[0], cell) {
-            Ok(c) => c.floor() as i64,
+            Ok(c) => days360_serial(c),
             Err(s) => return s,
         };
         let end_serial = match self.get_number(&args[1], cell) {
-            Ok(c) => c.floor() as i64,
+            Ok(c) => days360_serial(c),
             Err(s) => return s,
         };
+        // The European-method flag follows Excel's logical coercion: numbers are
+        // truthy when non-zero, and only the text "TRUE"/"FALSE" is accepted.
         let method = if args.len() == 3 {
-            match self.get_number(&args[2], cell) {
-                Ok(f) => f != 0.0,
+            match self.get_boolean(&args[2], cell) {
+                Ok(b) => b,
                 Err(s) => return s,
             }
         } else {
             false
         };
-        let start_date = match self.excel_date(start_serial, cell) {
-            Ok(d) => d,
-            Err(e) => return e,
+        let out_of_range = || {
+            CalcResult::new_error(
+                Error::NUM,
+                cell,
+                "Out of range parameters for date".to_string(),
+            )
         };
-        let end_date = match self.excel_date(end_serial, cell) {
-            Ok(d) => d,
-            Err(e) => return e,
+        let start = match excel_serial_to_ymd(start_serial) {
+            Some(ymd) => ymd,
+            None => return out_of_range(),
         };
-        fn last_day_feb(year: i32) -> u32 {
-            if (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 {
-                29
-            } else {
-                28
-            }
-        }
-        let mut sd_day = start_date.day();
-        let sd_month = start_date.month();
-        let sd_year = start_date.year();
-        let mut ed_day = end_date.day();
-        let ed_month = end_date.month();
-        let ed_year = end_date.year();
-
-        if method {
-            if sd_day == 31 {
-                sd_day = 30;
-            }
-            if ed_day == 31 {
-                ed_day = 30;
-            }
+        let end = match excel_serial_to_ymd(end_serial) {
+            Some(ymd) => ymd,
+            None => return out_of_range(),
+        };
+        let result = if !method {
+            days360_us(start, end)
         } else {
-            if (sd_month == 2 && sd_day == last_day_feb(sd_year)) || sd_day == 31 {
-                sd_day = 30;
-            }
-            if ed_month == 2 && ed_day == last_day_feb(ed_year) && sd_day == 30 {
-                ed_day = 30;
-            }
-            if ed_day == 31 && sd_day >= 30 {
-                ed_day = 30;
-            }
-        }
-
-        let result = (ed_year - sd_year) * 360
-            + (ed_month as i32 - sd_month as i32) * 30
-            + (ed_day as i32 - sd_day as i32);
-        CalcResult::Number(result as f64)
+            days360_eu(start, end)
+        };
+        CalcResult::Number(result)
     }
 
     pub(crate) fn fn_weekday(&mut self, args: &[Node], cell: CellReferenceIndex) -> CalcResult {
         if !(1..=2).contains(&args.len()) {
             return CalcResult::new_args_number_error(cell);
         }
+        // Excel evaluates the date argument before `return_type`, so an invalid
+        // date yields its error even when `return_type` is #DIV/0! or #N/A (#1502).
+        let dates = match self.get_number_or_array(&args[0], cell) {
+            Ok(v) => v,
+            Err(first) => return first,
+        };
         let return_type = if args.len() == 2 {
             match self.get_number(&args[1], cell) {
                 Ok(f) => f as i32,
-                Err(s) => return s,
+                Err(error) => {
+                    // The error goes to every element if the dates are an
+                    // array; the ones that are an error keep theirs.
+                    return match dates {
+                        NumberOrArray::Array(array) => {
+                            array_of_errors(&array, error, |node| match node {
+                                ArrayNode::Error(error) => Some(error.clone()),
+                                ArrayNode::String(s) if self.cast_number(s).is_none() => {
+                                    Some(Error::VALUE)
+                                }
+                                _ => None,
+                            })
+                        }
+                        NumberOrArray::Number(_) => error,
+                    };
+                }
             }
         } else {
             1
         };
-        // Broadcasts element-wise over a range/array date argument.
-        self.apply_number_unary(&args[0], cell, move |serial| {
+        // Broadcasts element-wise over a range/array date argument. `dates` was
+        // already evaluated above, so we reuse it instead of re-evaluating the node.
+        self.apply_number_unary_value(dates, cell, move |serial| {
             let date = from_excel_date(serial.floor() as i64).map_err(|_| Error::NUM)?;
             weekday_number(date, return_type)
         })
@@ -1470,7 +1720,7 @@ impl<'a> Model<'a> {
         if !(1..=2).contains(&args.len()) {
             return CalcResult::new_args_number_error(cell);
         }
-        let serial = match self.get_number(&args[0], cell) {
+        let serial = match self.get_number_no_bools(&args[0], cell) {
             Ok(c) => c.floor() as i64,
             Err(s) => return s,
         };
@@ -1479,7 +1729,7 @@ impl<'a> Model<'a> {
             Err(e) => return e,
         };
         let return_type = if args.len() == 2 {
-            match self.get_number(&args[1], cell) {
+            match self.get_number_no_bools(&args[1], cell) {
                 Ok(f) => f as i32,
                 Err(s) => return s,
             }
@@ -1499,9 +1749,6 @@ impl<'a> Model<'a> {
             15 => chrono::Weekday::Fri,
             16 => chrono::Weekday::Sat,
             17 => chrono::Weekday::Sun,
-            x if x <= 0 || x == 3 => {
-                return CalcResult::new_error(Error::VALUE, cell, "Invalid return_type".to_string())
-            }
             _ => return CalcResult::new_error(Error::NUM, cell, "Invalid return_type".to_string()),
         };
         let mut first = match chrono::NaiveDate::from_ymd_opt(date.year(), 1, 1) {
@@ -1548,7 +1795,7 @@ impl<'a> Model<'a> {
         if !(2..=3).contains(&args.len()) {
             return CalcResult::new_args_number_error(cell);
         }
-        let start_serial = match self.get_number(&args[0], cell) {
+        let start_serial = match self.get_number_no_bools(&args[0], cell) {
             Ok(c) => c.floor() as i64,
             Err(s) => return s,
         };
@@ -1556,8 +1803,8 @@ impl<'a> Model<'a> {
             Ok(d) => d,
             Err(e) => return e,
         };
-        let mut days = match self.get_number(&args[1], cell) {
-            Ok(f) => f as i32,
+        let mut days = match self.get_number_no_bools(&args[1], cell) {
+            Ok(f) => f.floor() as i32,
             Err(s) => return s,
         };
         let weekend = [false, false, false, false, false, true, true];
@@ -1567,11 +1814,25 @@ impl<'a> Model<'a> {
         };
         while days != 0 {
             if days > 0 {
+                if date.num_days_from_ce() - EXCEL_DATE_BASE >= MAXIMUM_DATE_SERIAL_NUMBER {
+                    return CalcResult::Error {
+                        error: Error::NUM,
+                        origin: cell,
+                        message: DATE_OUT_OF_RANGE_MESSAGE.to_string(),
+                    };
+                }
                 date += chrono::Duration::days(1);
                 if !Self::is_weekend(date.weekday(), &weekend) && !holiday_set.contains(&date) {
                     days -= 1;
                 }
             } else {
+                if date.num_days_from_ce() - EXCEL_DATE_BASE <= MINIMUM_DATE_SERIAL_NUMBER {
+                    return CalcResult::Error {
+                        error: Error::NUM,
+                        origin: cell,
+                        message: DATE_OUT_OF_RANGE_MESSAGE.to_string(),
+                    };
+                }
                 date -= chrono::Duration::days(1);
                 if !Self::is_weekend(date.weekday(), &weekend) && !holiday_set.contains(&date) {
                     days += 1;
@@ -1614,7 +1875,7 @@ impl<'a> Model<'a> {
         if !(2..=4).contains(&args.len()) {
             return CalcResult::new_args_number_error(cell);
         }
-        let start_serial = match self.get_number(&args[0], cell) {
+        let start_serial = match self.get_number_no_bools(&args[0], cell) {
             Ok(c) => c.floor() as i64,
             Err(s) => return s,
         };
@@ -1622,8 +1883,8 @@ impl<'a> Model<'a> {
             Ok(d) => d,
             Err(e) => return e,
         };
-        let mut days = match self.get_number(&args[1], cell) {
-            Ok(f) => f as i32,
+        let mut days = match self.get_number_no_bools(&args[1], cell) {
+            Ok(f) => f.floor() as i32,
             Err(s) => return s,
         };
         let weekend_mask = match self.weekend_mask(args.get(2), cell) {
@@ -1646,12 +1907,26 @@ impl<'a> Model<'a> {
 
         while days != 0 {
             if days > 0 {
+                if date.num_days_from_ce() - EXCEL_DATE_BASE >= MAXIMUM_DATE_SERIAL_NUMBER {
+                    return CalcResult::Error {
+                        error: Error::NUM,
+                        origin: cell,
+                        message: DATE_OUT_OF_RANGE_MESSAGE.to_string(),
+                    };
+                }
                 date += chrono::Duration::days(1);
                 if !Self::is_weekend(date.weekday(), &weekend_mask) && !holiday_set.contains(&date)
                 {
                     days -= 1;
                 }
             } else {
+                if date.num_days_from_ce() - EXCEL_DATE_BASE <= MINIMUM_DATE_SERIAL_NUMBER {
+                    return CalcResult::Error {
+                        error: Error::NUM,
+                        origin: cell,
+                        message: DATE_OUT_OF_RANGE_MESSAGE.to_string(),
+                    };
+                }
                 date -= chrono::Duration::days(1);
                 if !Self::is_weekend(date.weekday(), &weekend_mask) && !holiday_set.contains(&date)
                 {
@@ -1667,16 +1942,16 @@ impl<'a> Model<'a> {
         if !(2..=3).contains(&args.len()) {
             return CalcResult::new_args_number_error(cell);
         }
-        let start_serial = match self.get_number(&args[0], cell) {
+        let start_serial = match self.get_number_no_bools(&args[0], cell) {
             Ok(c) => c.floor() as i64,
             Err(s) => return s,
         };
-        let end_serial = match self.get_number(&args[1], cell) {
+        let end_serial = match self.get_number_no_bools(&args[1], cell) {
             Ok(c) => c.floor() as i64,
             Err(s) => return s,
         };
         let basis = if args.len() == 3 {
-            match self.get_number(&args[2], cell) {
+            match self.get_number_no_bools(&args[2], cell) {
                 Ok(f) => f as i32,
                 Err(s) => return s,
             }
@@ -1694,52 +1969,66 @@ impl<'a> Model<'a> {
         let days = (end_date - start_date).num_days() as f64;
         let result = match basis {
             0 => {
-                let d360 = self.fn_days360(args, cell);
-                if let CalcResult::Number(n) = d360 {
-                    n / 360.0
-                } else {
-                    return d360;
+                // YEARFRAC basis 0 uses the financial US 30/360 convention
+                // (`dateDiff360Us`, ModifyStartDate), which differs from the
+                // DAYS360 worksheet function for February month-ends: a
+                // February-end *end* date only collapses to 30 when the *start*
+                // is also a February month-end, and the `end == 31` rule tests
+                // the original (un-normalised) start day.
+                let last_day_feb = |year: i32| if is_leap_year(year) { 29 } else { 28 };
+                let sd_is_feb_last =
+                    start_date.month() == 2 && start_date.day() == last_day_feb(start_date.year());
+                let ed_is_feb_last =
+                    end_date.month() == 2 && end_date.day() == last_day_feb(end_date.year());
+                let mut sd_day = start_date.day() as i32;
+                let mut ed_day = end_date.day() as i32;
+
+                if ed_is_feb_last && sd_is_feb_last {
+                    ed_day = 30;
                 }
+                if ed_day == 31 && sd_day >= 30 {
+                    ed_day = 30;
+                }
+                if sd_day == 31 {
+                    sd_day = 30;
+                }
+                if sd_is_feb_last {
+                    sd_day = 30;
+                }
+                let d360 = (end_date.year() - start_date.year()) * 360
+                    + (end_date.month() as i32 - start_date.month() as i32) * 30
+                    + (ed_day - sd_day);
+                d360 as f64 / 360.0
             }
             1 => {
-                // Procedure E
+                // Actual/Actual. Port of ExcelFinancialFunctions
+                // `ActualActual.DaysInYear`: yearfrac = actual_days / DaysInYear.
+                let (y1, m1, d1) = (start_date.year(), start_date.month(), start_date.day());
+                let (y2, m2, d2) = (end_date.year(), end_date.month(), end_date.day());
 
-                let start_year = start_date.year();
-                let end_year = end_date.year();
+                // lessOrEqualToAYearApart
+                let within_a_year =
+                    y1 == y2 || (y2 == y1 + 1 && (m1 > m2 || (m1 == m2 && d1 >= d2)));
 
-                let step_a = start_year != end_year;
-                let step_b = start_year + 1 != end_year;
-                let step_c = start_date.month() < end_date.month();
-                let step_d = start_date.month() == end_date.month();
-                let step_e = start_date.day() <= end_date.day();
-                let step_f = step_a && (step_b || step_c || (step_d && step_e));
-                if step_f {
-                    // 7.
-                    // return average of days in year between start_year and end_year, inclusive
-                    let mut total_days = 0;
-                    for year in start_year..=end_year {
-                        if is_leap_year(year) {
-                            total_days += 366;
-                        } else {
-                            total_days += 365;
-                        }
-                    }
-                    days / (total_days as f64 / (end_year - start_year + 1) as f64)
-                } else if step_a && is_leap_year(start_year) {
-                    // 8.
-                    days / 366.0
-                } else if is_feb_29_between_dates(start_date, end_date) {
-                    // 9. If a February 29 occurs between date1 and date2 then return 366
-                    days / 366.0
-                } else if end_date.month() == 2 && end_date.day() == 29 {
-                    // 10. If date2 is February 29 then return 366
-                    days / 366.0
-                } else if !step_a && is_leap_year(start_year) {
-                    days / 366.0
+                let days_in_year = if !within_a_year {
+                    // Dates more than a year apart: average the calendar-year
+                    // lengths spanned, inclusive of both end years.
+                    let tot_days: i64 = (y1..=y2)
+                        .map(|y| if is_leap_year(y) { 366 } else { 365 })
+                        .sum();
+                    tot_days as f64 / (y2 - y1 + 1) as f64
                 } else {
-                    // 11.
-                    days / 365.0
-                }
+                    // considerAsBisestile
+                    let consider = (y1 == y2 && is_leap_year(y1))
+                        || (m2 == 2 && d2 == 29)
+                        || is_feb29_between_consecutive_years(start_date, end_date);
+                    if consider {
+                        366.0
+                    } else {
+                        365.0
+                    }
+                };
+                days / days_in_year
             }
             2 => days / 360.0,
             3 => days / 365.0,
@@ -1774,16 +2063,23 @@ mod tests {
     }
 
     #[test]
-    fn test_is_feb_29_between_dates() {
+    fn test_is_feb29_between_consecutive_years() {
+        // Same leap year, spanning Feb 29.
         let d1 = chrono::NaiveDate::from_ymd_opt(2020, 2, 28).unwrap();
         let d2 = chrono::NaiveDate::from_ymd_opt(2020, 3, 1).unwrap();
-        assert!(is_feb_29_between_dates(d1, d2));
+        assert!(is_feb29_between_consecutive_years(d1, d2));
     }
 
     #[test]
-    fn test_is_feb_29_between_dates_false() {
+    fn test_is_feb29_between_consecutive_years_false() {
+        // Non-leap year, no Feb 29 in range.
         let d1 = chrono::NaiveDate::from_ymd_opt(2021, 2, 28).unwrap();
         let d2 = chrono::NaiveDate::from_ymd_opt(2021, 3, 1).unwrap();
-        assert!(!is_feb_29_between_dates(d1, d2));
+        assert!(!is_feb29_between_consecutive_years(d1, d2));
+
+        // Leap year, but the period starts after Feb 29 (March).
+        let d3 = chrono::NaiveDate::from_ymd_opt(1992, 3, 4).unwrap();
+        let d4 = chrono::NaiveDate::from_ymd_opt(1993, 3, 1).unwrap();
+        assert!(!is_feb29_between_consecutive_years(d3, d4));
     }
 }

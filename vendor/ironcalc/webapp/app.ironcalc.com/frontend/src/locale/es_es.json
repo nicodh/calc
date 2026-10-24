@@ -5,7 +5,12 @@
   "default_workbook_name": "Libro",
   "errors": {
     "model_not_found": "Modelo no encontrado o error al cargar",
-    "example_not_found": "Archivo de ejemplo no encontrado o error al cargar"
+    "example_not_found": "Archivo de ejemplo no encontrado o error al cargar",
+    "storage_save_failed": "No se han podido guardar los cambios. Puede que el navegador no tenga espacio de almacenamiento."
+  },
+  "unsaved_bar": {
+    "message": "Estás viendo un libro de solo lectura. Guarda una copia para editarlo.",
+    "save_copy": "Guardar una copia"
   },
   "welcome_dialog": {
     "title": "Bienvenido a IronCalc",
@@ -14,7 +19,7 @@
     "new": "Nuevo",
     "blank_workbook": "Libro en blanco",
     "import_workbook": "Importar libro",
-    "storage_warning": "<warn>¡Atención!</warn> Esta aplicación es una prueba de concepto y no un producto terminado. Siéntete libre de explorar, compartir y subir/descargar modelos, pero no compartas ni subas modelos con datos sensibles o privados. Los datos se eliminarán periódicamente. <docsLink>Leer más</docsLink>",
+    "storage_warning": "<warn>¡Atención!</warn> Esta aplicación es una prueba de concepto y no un producto terminado. Puedes explorar, compartir y subir/descargar modelos, pero no compartas ni subas modelos con datos sensibles o privados. Los datos se eliminarán periódicamente. <docsLink>Leer más</docsLink>",
     "templates": {
       "choose_template": "Elegir una plantilla",
       "templates": "Plantillas",
@@ -27,8 +32,6 @@
       "category_games": "Juegos",
       "yearly_calendar": "Calendario anual",
       "yearly_calendar_description": "Planifica y visualiza todo el año.",
-      "mortgage_calculator": "Calculadora de hipoteca",
-      "mortgage_calculator_description": "Estima pagos, intereses y coste total.",
       "crossword": "Crucigrama",
       "crossword_description": "Rellena la cuadrícula y resuelve las pistas.",
       "travel_expenses_tracker": "Seguimiento de gastos de viaje",
@@ -39,10 +42,6 @@
       "gantt_project_tracker_description": "Planifica tareas y plazos en un diagrama de Gantt.",
       "weekly_timesheet": "Hoja de horas semanal",
       "weekly_timesheet_description": "Registra y revisa las horas trabajadas cada semana.",
-      "eu_salary_calculator": "Calculadora de salario UE",
-      "eu_salary_calculator_description": "Estima el salario neto tras impuestos en la UE.",
-      "absence_schedule": "Calendario de ausencias",
-      "absence_schedule_description": "Controla vacaciones y ausencias del equipo.",
       "wordle": "Wordle",
       "wordle_description": "Adivina la palabra oculta de cinco letras.",
       "event_calendar": "Calendario de eventos",
@@ -57,6 +56,7 @@
     "search_workbook": "Buscar libros",
     "search_placeholder": "Buscar libro...",
     "clear_search": "Borrar búsqueda",
+    "empty_state": "Aún no hay libros. Los libros que crees o guardes aparecerán aquí.",
     "search_no_results": "Tu búsqueda no coincide con ningún libro.",
     "pinned": "Fijados",
     "today": "Hoy",
@@ -70,22 +70,20 @@
       "delete": "Eliminar libro"
     },
     "alert": {
-      "title": "Atención",
-      "subtitle": "IronCalc almacena tus datos solo en el almacenamiento local de tu navegador.",
-      "subtitle2": "<bold>Descarga tu XLSX con frecuencia</bold> – las versiones futuras podrían no abrir los libros actuales, incluso si se comparten.",
       "close": "Cerrar"
     },
     "documentation": "Documentación",
     "cancel": "Cancelar",
     "delete_workbooks_one": "Eliminar {{count}} libro",
     "delete_workbooks_other": "Eliminar {{count}} libros",
-    "bulk_delete_message_one": "Este libro será eliminado permanentemente.",
-    "bulk_delete_message_other": "{{count}} libros serán eliminados permanentemente.",
+    "bulk_delete_message_one": "Este libro será eliminado permanentemente. Los enlaces que hayas compartido seguirán funcionando.",
+    "bulk_delete_message_other": "{{count}} libros serán eliminados permanentemente. Los enlaces que hayas compartido seguirán funcionando.",
     "select_workbook": "Seleccionar {{name}}"
   },
   "file_bar": {
     "open_sidebar": "Abrir barra lateral",
     "close_sidebar": "Cerrar barra lateral",
+    "cloud_warning": "<warn>¡Atención!</warn> Esta aplicación es una prueba de concepto y no un producto terminado. Siéntete libre de explorar, compartir y subir/descargar modelos, pero no compartas ni subas modelos con datos sensibles o privados. Los datos se eliminarán periódicamente.",
     "file_menu": {
       "button": "Archivo",
       "new_blank_workbook": "Nuevo libro en blanco",
@@ -105,11 +103,14 @@
         "button": "Eliminar libro",
         "title": "¿Estás seguro?",
         "subtitle": "El libro '{{workbookName}}' será eliminado permanentemente.",
-        "warning": "Esta acción no se puede deshacer.",
+        "warning": "Esta acción no se puede deshacer. Los enlaces que hayas compartido seguirán funcionando.",
         "confirm_button": "Sí, eliminar",
         "cancel_button": "Cancelar"
       },
-      "default_language": "Idioma predeterminado"
+      "default_language": "Idioma predeterminado",
+      "appearance": "Apariencia",
+      "appearance_light": "Claro",
+      "appearance_dark": "Oscuro"
     },
     "help_menu": {
       "button": "Ayuda",
@@ -117,15 +118,11 @@
       "documentation": "Documentación",
       "keyboard_shortcuts": "Atajos de teclado"
     },
-    "title_input": {
-      "warning_text1": "Este libro se almacena solo en tu navegador. Para mantenerlo seguro, descárgalo como .xlsx.",
-      "warning_text2": " Las versiones futuras podrían ser incompatibles."
-    },
     "share_popover": {
       "button": "Compartir",
       "copy_url": "Copiar URL",
       "copied": "¡Copiado!",
-      "info_text": "Cualquier persona con el enlace podrá acceder a una copia de este libro"
+      "info_text": "Cualquier persona con el enlace podrá acceder a una copia de este libro. Los enlaces compartidos no se pueden eliminar."
     }
   },
   "loading_screen": {

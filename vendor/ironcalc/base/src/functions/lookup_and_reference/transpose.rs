@@ -1,13 +1,12 @@
+use crate::types::Position;
 use crate::{
     calc_result::CalcResult,
-    expressions::{
-        parser::{ArrayNode, Node},
-        types::CellReferenceIndex,
-    },
+    expressions::{parser::Node, types::CellReferenceIndex},
+    functions::spill_functions::transpose_array,
     model::Model,
 };
 
-impl<'a> Model<'a> {
+impl<'a, A: Position> Model<'a, A> {
     // ── TRANSPOSE ─────────────────────────────────────────────────────────────
 
     /// `=TRANSPOSE(array)`
@@ -23,17 +22,6 @@ impl<'a> Model<'a> {
             Err(e) => return e,
         };
 
-        if data.is_empty() {
-            return CalcResult::Array(vec![]);
-        }
-
-        let num_rows = data.len();
-        let num_cols = data[0].len();
-
-        let result: Vec<Vec<ArrayNode>> = (0..num_cols)
-            .map(|j| (0..num_rows).map(|i| data[i][j].clone()).collect())
-            .collect();
-
-        CalcResult::Array(result)
+        CalcResult::Array(transpose_array(data))
     }
 }

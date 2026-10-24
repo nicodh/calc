@@ -1,9 +1,8 @@
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use regex::Regex;
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use regex_lite::Regex;
 
-use crate::constants::{LAST_COLUMN, LAST_ROW};
 use crate::expressions::types::CellReferenceIndex;
 use crate::{
     calc_result::CalcResult, expressions::parser::Node, expressions::token::Error, model::Model,
@@ -16,6 +15,7 @@ use crate::functions::{
     },
     util::{compare_values, from_wildcard_to_regex, result_matches_regex},
 };
+use crate::types::Position;
 
 #[derive(PartialEq)]
 enum SearchMode {
@@ -134,7 +134,7 @@ fn linear_search(
     }
 }
 
-impl<'a> Model<'a> {
+impl<'a, A: Position> Model<'a, A> {
     /// `=XMATCH(lookup_value, lookup_array, [match_mode], [search_mode])`
     ///
     /// Returns the relative position (1-based) of an item in a row or column array.
@@ -203,7 +203,10 @@ impl<'a> Model<'a> {
             SearchMode::FirstToLast
         };
 
-        match self.evaluate_node_in_context(&args[1], cell) {
+        // Materialise `lookup_array` into a one-dimensional vector of values.
+        // It may be a range reference or an in-formula array constant `{…}`;
+        // either way it must be a single row or single column.
+        let array: Vec<CalcResult> = match self.evaluate_node_in_context(&args[1], cell) {
             CalcResult::Range { left, right } => {
                 let is_col_vec = left.column == right.column;
                 let is_row_vec = left.row == right.row;
@@ -218,102 +221,103 @@ impl<'a> Model<'a> {
                 // Honour entire-column/row references: clamp to worksheet used range.
                 let mut row2 = right.row;
                 let mut col2 = right.column;
-                if left.row == 1 && row2 == LAST_ROW {
-                    row2 = match self.workbook.worksheet(left.sheet) {
-                        Ok(s) => s.dimension().max_row,
-                        Err(_) => {
-                            return CalcResult::new_error(
-                                Error::ERROR,
-                                cell,
-                                format!("Invalid worksheet index: '{}'", left.sheet),
-                            )
-                        }
-                    };
-                }
-                if left.column == 1 && col2 == LAST_COLUMN {
-                    col2 = match self.workbook.worksheet(left.sheet) {
-                        Ok(s) => s.dimension().max_column,
-                        Err(_) => {
-                            return CalcResult::new_error(
-                                Error::ERROR,
-                                cell,
-                                format!("Invalid worksheet index: '{}'", left.sheet),
-                            )
-                        }
-                    };
+                match self.clip_to_used_area(left.sheet, left.row, left.column, row2, col2) {
+                    Ok((r, c)) => {
+                        row2 = r;
+                        col2 = c;
+                    }
+                    Err(message) => return CalcResult::new_error(Error::ERROR, cell, message),
                 }
                 let right = CellReferenceIndex {
                     sheet: right.sheet,
                     row: row2,
                     column: col2,
                 };
+                self.prepare_array(&left, &right, is_col_vec)
+            }
+            CalcResult::Array(rows) => {
+                // An array constant must be a single row or single column.
+                let n_rows = rows.len();
+                let n_cols = rows.first().map(|r| r.len()).unwrap_or(0);
+                let is_row_vec = n_rows == 1;
+                let is_col_vec = n_cols == 1;
+                if n_rows == 0 || n_cols == 0 || (!is_row_vec && !is_col_vec) {
+                    return CalcResult::new_error(
+                        Error::VALUE,
+                        cell,
+                        "lookup_array must be a single row or column".to_string(),
+                    );
+                }
+                rows.iter()
+                    .flatten()
+                    .map(|node| super::array_node_to_calc_result(node, cell))
+                    .collect()
+            }
+            error @ CalcResult::Error { .. } => return error,
+            _ => {
+                return CalcResult::new_error(
+                    Error::VALUE,
+                    cell,
+                    "lookup_array must be a range or array".to_string(),
+                )
+            }
+        };
 
-                match search_mode {
-                    SearchMode::FirstToLast | SearchMode::LastToFirst => {
-                        if match_mode == MatchMode::Regex {
-                            if let CalcResult::String(ref pat) = lookup_value {
-                                if Regex::new(pat).is_err() {
-                                    return CalcResult::new_error(
-                                        Error::VALUE,
-                                        cell,
-                                        "Invalid regular expression".to_string(),
-                                    );
-                                }
-                            }
-                        }
-                        let array = self.prepare_array(&left, &right, is_col_vec);
-                        match linear_search(&lookup_value, &array, &search_mode, match_mode) {
-                            Some(idx) => CalcResult::Number(idx as f64 + 1.0),
-                            None => CalcResult::new_error(Error::NA, cell, "Not found".to_string()),
-                        }
-                    }
-                    SearchMode::BinaryAscending | SearchMode::BinaryDescending => {
-                        if match_mode == MatchMode::Wildcard || match_mode == MatchMode::Regex {
+        match search_mode {
+            SearchMode::FirstToLast | SearchMode::LastToFirst => {
+                if match_mode == MatchMode::Regex {
+                    if let CalcResult::String(ref pat) = lookup_value {
+                        if Regex::new(pat).is_err() {
                             return CalcResult::new_error(
                                 Error::VALUE,
                                 cell,
-                                "Wildcard/regex match cannot be used with binary search"
-                                    .to_string(),
+                                "Invalid regular expression".to_string(),
                             );
-                        }
-                        let array = self.prepare_array(&left, &right, is_col_vec);
-                        let idx_opt = if match_mode == MatchMode::ExactMatchLarger {
-                            if search_mode == SearchMode::BinaryAscending {
-                                binary_search_or_greater(&lookup_value, &array)
-                            } else {
-                                binary_search_descending_or_greater(&lookup_value, &array)
-                            }
-                        } else if search_mode == SearchMode::BinaryAscending {
-                            binary_search_or_smaller(&lookup_value, &array)
-                        } else {
-                            binary_search_descending_or_smaller(&lookup_value, &array)
-                        };
-
-                        match idx_opt {
-                            None => CalcResult::new_error(Error::NA, cell, "Not found".to_string()),
-                            Some(l) => {
-                                if match_mode == MatchMode::Exact {
-                                    let v = &array[l as usize];
-                                    if compare_values(v, &lookup_value) != 0 {
-                                        return CalcResult::new_error(
-                                            Error::NA,
-                                            cell,
-                                            "Not found".to_string(),
-                                        );
-                                    }
-                                }
-                                CalcResult::Number(l as f64 + 1.0)
-                            }
                         }
                     }
                 }
+                match linear_search(&lookup_value, &array, &search_mode, match_mode) {
+                    Some(idx) => CalcResult::Number(idx as f64 + 1.0),
+                    None => CalcResult::new_error(Error::NA, cell, "Not found".to_string()),
+                }
             }
-            error @ CalcResult::Error { .. } => error,
-            _ => CalcResult::new_error(
-                Error::VALUE,
-                cell,
-                "lookup_array must be a range".to_string(),
-            ),
+            SearchMode::BinaryAscending | SearchMode::BinaryDescending => {
+                if match_mode == MatchMode::Wildcard || match_mode == MatchMode::Regex {
+                    return CalcResult::new_error(
+                        Error::VALUE,
+                        cell,
+                        "Wildcard/regex match cannot be used with binary search".to_string(),
+                    );
+                }
+                let idx_opt = if match_mode == MatchMode::ExactMatchLarger {
+                    if search_mode == SearchMode::BinaryAscending {
+                        binary_search_or_greater(&lookup_value, &array)
+                    } else {
+                        binary_search_descending_or_greater(&lookup_value, &array)
+                    }
+                } else if search_mode == SearchMode::BinaryAscending {
+                    binary_search_or_smaller(&lookup_value, &array)
+                } else {
+                    binary_search_descending_or_smaller(&lookup_value, &array)
+                };
+
+                match idx_opt {
+                    None => CalcResult::new_error(Error::NA, cell, "Not found".to_string()),
+                    Some(l) => {
+                        if match_mode == MatchMode::Exact {
+                            let v = &array[l as usize];
+                            if compare_values(v, &lookup_value) != 0 {
+                                return CalcResult::new_error(
+                                    Error::NA,
+                                    cell,
+                                    "Not found".to_string(),
+                                );
+                            }
+                        }
+                        CalcResult::Number(l as f64 + 1.0)
+                    }
+                }
+            }
         }
     }
 }

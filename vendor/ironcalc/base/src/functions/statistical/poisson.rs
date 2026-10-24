@@ -1,11 +1,12 @@
 use statrs::distribution::{Discrete, DiscreteCDF, Poisson};
 
 use crate::expressions::types::CellReferenceIndex;
+use crate::types::Position;
 use crate::{
     calc_result::CalcResult, expressions::parser::Node, expressions::token::Error, model::Model,
 };
 
-impl<'a> Model<'a> {
+impl<'a, A: Position> Model<'a, A> {
     // =POISSON.DIST(x, mean, cumulative)
     pub(crate) fn fn_poisson_dist(
         &mut self,
@@ -17,13 +18,13 @@ impl<'a> Model<'a> {
         }
 
         // x
-        let x = match self.get_number_no_bools(&args[0], cell) {
-            Ok(f) => f.trunc(),
+        let x = match self.get_number(&args[0], cell) {
+            Ok(f) => f,
             Err(e) => return e,
         };
 
         // mean (lambda)
-        let lambda = match self.get_number_no_bools(&args[1], cell) {
+        let lambda = match self.get_number(&args[1], cell) {
             Ok(f) => f,
             Err(e) => return e,
         };
@@ -41,16 +42,16 @@ impl<'a> Model<'a> {
             };
         }
 
-        // Guard against insane k for u64
-        if x < 0.0 || x > (u64::MAX as f64) {
+        // Guard against large x
+        if x > (u64::MAX as f64) {
             return CalcResult::Error {
                 error: Error::NUM,
                 origin: cell,
-                message: "Invalid parameters for POISSON.DIST".to_string(),
+                message: "x is too large for POISSON.DIST".to_string(),
             };
         }
 
-        let k = x as u64;
+        let k = x.trunc() as u64;
 
         // Special-case lambda = 0: degenerate distribution at 0
         if lambda == 0.0 {

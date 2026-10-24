@@ -2,19 +2,20 @@
 
 use std::collections::HashMap;
 
+use super::xml::XmlNode;
 use ironcalc_base::cf_types::{
     icon_set_icons, CfRule, Cfvo, ColorScaleThreshold, ConditionalFormatting, Icon, IconThreshold,
     PeriodType, TextOperator, ValueOperator,
 };
-use roxmltree::Node;
 
 use crate::error::XlsxError;
 
-use ironcalc_base::types::{Color, Theme};
+use ironcalc_base::types::{Color, Dxf, RangeRef, Theme};
 
+use super::styles::parse_dxf;
 use super::util::{get_attribute, get_color};
 
-fn parse_cfvo(node: Node) -> Result<Cfvo, XlsxError> {
+fn parse_cfvo(node: &XmlNode) -> Result<Cfvo, XlsxError> {
     let val = node.attribute("val").unwrap_or("0");
     match node.attribute("type").unwrap_or("num") {
         "min" => Ok(Cfvo::Min),
@@ -32,7 +33,7 @@ fn parse_cfvo(node: Node) -> Result<Cfvo, XlsxError> {
 
 /// Parses an x14-namespace cfvo node where autoMin/autoMax map to `None`
 /// (automatic axis) and the value lives in a child `<xm:f>` element.
-fn parse_cfvo_x14(node: Node) -> Option<Cfvo> {
+fn parse_cfvo_x14(node: &XmlNode) -> Option<Cfvo> {
     let cfvo_type = node.attribute("type").unwrap_or("num");
     // autoMin / autoMax → None signals "use automatic axis"
     if cfvo_type == "autoMin" || cfvo_type == "autoMax" {
@@ -65,7 +66,7 @@ struct DataBarExt {
 
 /// Pre-parses the worksheet-level `<extLst>` for x14 extended data bar rules.
 /// Returns a map keyed by the x14:id GUID (e.g. "{7896903A-...}").
-fn parse_x14_data_bars(ws: Node, theme: &Theme) -> HashMap<String, DataBarExt> {
+fn parse_x14_data_bars(ws: &XmlNode, theme: &Theme) -> HashMap<String, DataBarExt> {
     let mut map = HashMap::new();
     for ext_lst in ws.children().filter(|n| n.has_tag_name("extLst")) {
         for ext in ext_lst.children().filter(|n| n.has_tag_name("ext")) {
@@ -182,9 +183,19 @@ fn rating_icon_color(icon_set_attr: &str) -> (Icon, Color) {
     }
 }
 
-/// Parses x14 extended icon-set rules from the worksheet's `<extLst>`.
-/// Returns the resulting ConditionalFormatting entries (range + priority embedded).
-fn parse_x14_icon_sets(ws: Node) -> Vec<ConditionalFormatting> {
+/// Parses standalone x14 conditional-formatting rules from the worksheet's
+/// `<extLst>`: extended icon sets and `expression` rules that live only in the
+/// x14 extension (e.g. formulas with cross-sheet references). `expression`
+/// rules carry an inline `<x14:dxf>` format, which is appended to `dxfs` and
+/// referenced back by index.
+///
+/// Unlike data bars (see [`parse_x14_data_bars`]), these rules are not merged
+/// into a simple counterpart: they own their range (`<xm:sqref>`) and format.
+fn parse_x14_standalone_rules(
+    ws: &XmlNode,
+    theme: &Theme,
+    dxfs: &mut Vec<Dxf>,
+) -> Result<Vec<ConditionalFormatting>, XlsxError> {
     let mut result = Vec::new();
     for ext_lst in ws.children().filter(|n| n.has_tag_name("extLst")) {
         for ext in ext_lst.children().filter(|n| n.has_tag_name("ext")) {
@@ -197,114 +208,32 @@ fn parse_x14_icon_sets(ws: Node) -> Vec<ConditionalFormatting> {
                     .filter(|n| n.has_tag_name("conditionalFormatting"))
                 {
                     // Range lives in <xm:sqref> (local name "sqref")
-                    let range = match cf.children().find(|n| n.has_tag_name("sqref")) {
+                    let ranges = match cf.children().find(|n| n.has_tag_name("sqref")) {
                         Some(n) => match n.text() {
-                            Some(t) => t.to_string(),
+                            Some(t) => RangeRef::parse_sqref(t),
                             None => continue,
                         },
                         None => continue,
                     };
 
                     for rule in cf.children().filter(|n| n.has_tag_name("cfRule")) {
-                        if rule.attribute("type") != Some("iconSet") {
-                            continue;
-                        }
                         let priority = rule
                             .attribute("priority")
                             .unwrap_or("0")
                             .parse::<u32>()
                             .unwrap_or(0);
-                        let is_node = match rule.children().find(|n| n.has_tag_name("iconSet")) {
-                            Some(n) => n,
-                            None => continue,
-                        };
 
-                        let icon_set_attr =
-                            is_node.attribute("iconSet").unwrap_or("3TrafficLights1");
-                        let is_custom = is_node.attribute("custom") == Some("1");
-                        let show_value = is_node.attribute("showValue") != Some("0");
-
-                        // cfvo values live in <xm:f> children.
-                        // is_strict=true → >= (gte="1", default); is_strict=false → > (gte="0")
-                        let cfvo_with_strict: Vec<(Cfvo, bool)> = is_node
-                            .children()
-                            .filter(|n| n.has_tag_name("cfvo"))
-                            .filter_map(|n| {
-                                let cfvo = parse_cfvo_x14(n)?;
-                                let is_strict = n.attribute("gte") != Some("0");
-                                Some((cfvo, is_strict))
-                            })
-                            .collect();
-
-                        if cfvo_with_strict.is_empty() {
-                            continue;
-                        }
-
-                        let cf_rule = if is_custom {
-                            // Explicit per-icon overrides via <x14:cfIcon iconSet="..." iconId="..."/>
-                            let icon_list: Vec<(Icon, Color)> = is_node
-                                .children()
-                                .filter(|n| n.has_tag_name("cfIcon"))
-                                .map(|n| {
-                                    let set = n.attribute("iconSet").unwrap_or("3TrafficLights1");
-                                    let id = n
-                                        .attribute("iconId")
-                                        .and_then(|s| s.parse::<u32>().ok())
-                                        .unwrap_or(0);
-                                    icon_from_excel_id(set, id)
-                                })
-                                .collect();
-
-                            if icon_list.is_empty() {
-                                continue;
-                            }
-
-                            let thresholds: Vec<IconThreshold> = icon_list
-                                .into_iter()
-                                .zip(cfvo_with_strict)
-                                .map(|((icon, color), (cfvo, is_strict))| IconThreshold {
-                                    icon,
-                                    cfvo,
-                                    color,
-                                    is_strict,
-                                })
-                                .collect();
-
-                            CfRule::IconSet {
-                                thresholds,
-                                show_value,
-                            }
-                        } else if rating_count(icon_set_attr).is_some() {
-                            let (icon, color) = rating_icon_color(icon_set_attr);
-                            CfRule::IconRating {
-                                icon,
-                                color,
-                                thresholds: cfvo_with_strict,
-                                show_value,
-                            }
-                        } else {
-                            let icon_colors = match icon_set_icons(icon_set_attr) {
-                                Some(v) => v,
+                        let cf_rule = match rule.attribute("type") {
+                            Some("iconSet") => match parse_x14_icon_set_rule(rule) {
+                                Some(r) => r,
                                 None => continue,
-                            };
-                            let thresholds: Vec<IconThreshold> = icon_colors
-                                .into_iter()
-                                .zip(cfvo_with_strict)
-                                .map(|((icon, color), (cfvo, is_strict))| IconThreshold {
-                                    icon,
-                                    cfvo,
-                                    color,
-                                    is_strict,
-                                })
-                                .collect();
-                            CfRule::IconSet {
-                                thresholds,
-                                show_value,
-                            }
+                            },
+                            Some("expression") => parse_x14_expression_rule(rule, theme, dxfs)?,
+                            _ => continue,
                         };
 
                         result.push(ConditionalFormatting {
-                            range: range.clone(),
+                            ranges: ranges.clone(),
                             cf_rule,
                             priority,
                         });
@@ -313,7 +242,125 @@ fn parse_x14_icon_sets(ws: Node) -> Vec<ConditionalFormatting> {
             }
         }
     }
-    result
+    Ok(result)
+}
+
+/// Builds a [`CfRule`] from an x14 `iconSet` cfRule node, or `None` if the node
+/// is malformed / references an unknown icon set.
+fn parse_x14_icon_set_rule(rule: &XmlNode) -> Option<CfRule> {
+    let is_node = rule.children().find(|n| n.has_tag_name("iconSet"))?;
+
+    let icon_set_attr = is_node.attribute("iconSet").unwrap_or("3TrafficLights1");
+    let is_custom = is_node.attribute("custom") == Some("1");
+    let show_value = is_node.attribute("showValue") != Some("0");
+
+    // cfvo values live in <xm:f> children.
+    // is_strict=true → >= (gte="1", default); is_strict=false → > (gte="0")
+    let cfvo_with_strict: Vec<(Cfvo, bool)> = is_node
+        .children()
+        .filter(|n| n.has_tag_name("cfvo"))
+        .filter_map(|n| {
+            let cfvo = parse_cfvo_x14(n)?;
+            let is_strict = n.attribute("gte") != Some("0");
+            Some((cfvo, is_strict))
+        })
+        .collect();
+
+    if cfvo_with_strict.is_empty() {
+        return None;
+    }
+
+    if is_custom {
+        // Explicit per-icon overrides via <x14:cfIcon iconSet="..." iconId="..."/>
+        let icon_list: Vec<(Icon, Color)> = is_node
+            .children()
+            .filter(|n| n.has_tag_name("cfIcon"))
+            .map(|n| {
+                let set = n.attribute("iconSet").unwrap_or("3TrafficLights1");
+                let id = n
+                    .attribute("iconId")
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .unwrap_or(0);
+                icon_from_excel_id(set, id)
+            })
+            .collect();
+
+        if icon_list.is_empty() {
+            return None;
+        }
+
+        let thresholds: Vec<IconThreshold> = icon_list
+            .into_iter()
+            .zip(cfvo_with_strict)
+            .map(|((icon, color), (cfvo, is_strict))| IconThreshold {
+                icon,
+                cfvo,
+                color,
+                is_strict,
+            })
+            .collect();
+
+        Some(CfRule::IconSet {
+            thresholds,
+            show_value,
+        })
+    } else if rating_count(icon_set_attr).is_some() {
+        let (icon, color) = rating_icon_color(icon_set_attr);
+        Some(CfRule::IconRating {
+            icon,
+            color,
+            thresholds: cfvo_with_strict,
+            show_value,
+        })
+    } else {
+        let icon_colors = icon_set_icons(icon_set_attr)?;
+        let thresholds: Vec<IconThreshold> = icon_colors
+            .into_iter()
+            .zip(cfvo_with_strict)
+            .map(|((icon, color), (cfvo, is_strict))| IconThreshold {
+                icon,
+                cfvo,
+                color,
+                is_strict,
+            })
+            .collect();
+        Some(CfRule::IconSet {
+            thresholds,
+            show_value,
+        })
+    }
+}
+
+/// Builds a [`CfRule::Formula`] from an x14 `expression` cfRule node. The inline
+/// `<x14:dxf>` format is appended to `dxfs` and referenced back by index.
+fn parse_x14_expression_rule(
+    rule: &XmlNode,
+    theme: &Theme,
+    dxfs: &mut Vec<Dxf>,
+) -> Result<CfRule, XlsxError> {
+    // Formula lives in <xm:f> (local name "f").
+    let formula = rule
+        .children()
+        .find(|n| n.has_tag_name("f"))
+        .and_then(|n| n.text())
+        .unwrap_or("")
+        .to_string();
+    let stop_if_true = rule.attribute("stopIfTrue") == Some("1");
+    // Inline <x14:dxf> format; append it to the shared dxfs and reference by index.
+    let dxf_id = match rule.children().find(|n| n.has_tag_name("dxf")) {
+        Some(dxf_node) => {
+            let dxf = parse_dxf(dxf_node, theme, None)?;
+            let id = dxfs.len() as u32;
+            dxfs.push(dxf);
+            id
+        }
+        None => 0,
+    };
+    Ok(CfRule::Formula {
+        formula: format!("={formula}"),
+        dxf_id,
+        stop_if_true,
+    })
 }
 
 fn parse_operator(s: &str) -> Result<ValueOperator, XlsxError> {
@@ -370,8 +417,9 @@ fn rating_count(icon_set_attr: &str) -> Option<u32> {
 }
 
 pub(super) fn load_conditional_formatting(
-    ws: Node,
+    ws: &XmlNode,
     theme: &Theme,
+    dxfs: &mut Vec<Dxf>,
 ) -> Result<Vec<ConditionalFormatting>, XlsxError> {
     let x14_data_bars = parse_x14_data_bars(ws, theme);
     let mut result = Vec::new();
@@ -380,7 +428,7 @@ pub(super) fn load_conditional_formatting(
         .children()
         .filter(|n| n.has_tag_name("conditionalFormatting"))
     {
-        let range = get_attribute(&cf, "sqref")?.to_string();
+        let ranges = RangeRef::parse_sqref(get_attribute(cf, "sqref")?);
 
         for cf_rule in cf.children().filter(|n| n.has_tag_name("cfRule")) {
             let priority = cf_rule
@@ -401,7 +449,7 @@ pub(super) fn load_conditional_formatting(
 
             let rule = match cf_type {
                 "colorScale" => {
-                    let cs_nodes: Vec<Node> = cf_rule
+                    let cs_nodes: Vec<&XmlNode> = cf_rule
                         .children()
                         .filter(|n| n.has_tag_name("colorScale"))
                         .collect();
@@ -411,7 +459,7 @@ pub(super) fn load_conditional_formatting(
                     let mut cfvo_list: Vec<Cfvo> = Vec::new();
                     let mut color_list: Vec<Color> = Vec::new();
                     for child in cs_nodes[0].children() {
-                        match child.tag_name().name() {
+                        match child.tag_name() {
                             "cfvo" => cfvo_list.push(parse_cfvo(child)?),
                             "color" => {
                                 let c = get_color(child, theme)?;
@@ -500,7 +548,7 @@ pub(super) fn load_conditional_formatting(
                     }
                 }
                 "dataBar" => {
-                    let db_nodes: Vec<Node> = cf_rule
+                    let db_nodes: Vec<&XmlNode> = cf_rule
                         .children()
                         .filter(|n| n.has_tag_name("dataBar"))
                         .collect();
@@ -512,7 +560,7 @@ pub(super) fn load_conditional_formatting(
                     let mut simple_cfvos: Vec<Cfvo> = Vec::new();
                     let mut positive_color = Color::None;
                     for child in db.children() {
-                        match child.tag_name().name() {
+                        match child.tag_name() {
                             "cfvo" => simple_cfvos.push(parse_cfvo(child)?),
                             "color" => {
                                 let c = get_color(child, theme)?;
@@ -557,7 +605,7 @@ pub(super) fn load_conditional_formatting(
                     }
                 }
                 "iconSet" => {
-                    let is_nodes: Vec<Node> = cf_rule
+                    let is_nodes: Vec<&XmlNode> = cf_rule
                         .children()
                         .filter(|n| n.has_tag_name("iconSet"))
                         .collect();
@@ -571,13 +619,13 @@ pub(super) fn load_conditional_formatting(
 
                     // Collect cfvo nodes.
                     // is_strict=true → >= (gte="1", default); is_strict=false → > (gte="0")
-                    let cfvo_nodes: Vec<Node> = is_node
+                    let cfvo_nodes: Vec<&XmlNode> = is_node
                         .children()
                         .filter(|n| n.has_tag_name("cfvo"))
                         .collect();
                     let cfvo_vec: Vec<Cfvo> = cfvo_nodes
                         .iter()
-                        .map(|n| parse_cfvo(*n))
+                        .map(|n| parse_cfvo(n))
                         .collect::<Result<Vec<_>, _>>()?;
                     let is_strict_vec: Vec<bool> = cfvo_nodes
                         .iter()
@@ -667,14 +715,14 @@ pub(super) fn load_conditional_formatting(
             };
 
             result.push(ConditionalFormatting {
-                range: range.clone(),
+                ranges: ranges.clone(),
                 cf_rule: rule,
                 priority,
             });
         }
     }
 
-    result.extend(parse_x14_icon_sets(ws));
+    result.extend(parse_x14_standalone_rules(ws, theme, dxfs)?);
 
     // Excel: priority=1 is the most important rule (lowest number wins).
     // IronCalc: the highest priority number wins (new rules get max+1 and override old ones).
@@ -690,16 +738,87 @@ pub(super) fn load_conditional_formatting(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 
-    fn parse_ws(xml: &str) -> roxmltree::Document<'_> {
-        roxmltree::Document::parse(xml).expect("invalid test XML")
+    fn parse_ws(xml: &str) -> XmlNode {
+        XmlNode::parse_str(xml).expect("invalid test XML")
     }
 
     fn dummy_theme() -> Theme {
         Theme::default()
+    }
+
+    #[test]
+    fn test_x14_expression_rules_with_inline_dxf() {
+        // Two x14 expression rules sharing a non-consecutive sqref, each with an
+        // inline <x14:dxf> fill. These live only in the extLst (cross-sheet ref).
+        let xml = r#"<worksheet
+            xmlns:x14="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main"
+            xmlns:xm="http://schemas.microsoft.com/office/excel/2006/main">
+            <extLst><ext uri="{78C0D931-6437-407d-A8EE-F0AAD7539E65}">
+            <x14:conditionalFormattings>
+              <x14:conditionalFormatting>
+                <x14:cfRule type="expression" priority="1" id="{B7D9DC0D}">
+                  <xm:f>AND(B8&lt;&gt;"",UPPER(B8)=UPPER(Key!B3))</xm:f>
+                  <x14:dxf><fill><patternFill patternType="solid">
+                    <fgColor indexed="64"/><bgColor rgb="FFC6EFCE"/>
+                  </patternFill></fill></x14:dxf>
+                </x14:cfRule>
+                <xm:sqref>C9:F9 G8:G10 B12:B16</xm:sqref>
+              </x14:conditionalFormatting>
+              <x14:conditionalFormatting>
+                <x14:cfRule type="expression" priority="2" id="{70022BBB}">
+                  <xm:f>AND(B8&lt;&gt;"",UPPER(B8)&lt;&gt;UPPER(Key!B3))</xm:f>
+                  <x14:dxf><fill><patternFill patternType="solid">
+                    <fgColor indexed="64"/><bgColor rgb="FFFFC7CE"/>
+                  </patternFill></fill></x14:dxf>
+                </x14:cfRule>
+                <xm:sqref>C9:F9 G8:G10 B12:B16</xm:sqref>
+              </x14:conditionalFormatting>
+            </x14:conditionalFormattings>
+            </ext></extLst>
+        </worksheet>"#;
+        let doc = parse_ws(xml);
+        let ws = &doc;
+        let mut dxfs: Vec<Dxf> = Vec::new();
+        let rules = load_conditional_formatting(ws, &dummy_theme(), &mut dxfs).unwrap();
+
+        // Both expression rules are imported.
+        assert_eq!(rules.len(), 2);
+        // Each carries its own inline dxf appended to the shared list.
+        assert_eq!(dxfs.len(), 2);
+
+        for cf in &rules {
+            // Non-consecutive range is preserved verbatim.
+            assert_eq!(RangeRef::to_sqref(&cf.ranges), "C9:F9 G8:G10 B12:B16");
+            match &cf.cf_rule {
+                CfRule::Formula {
+                    formula, dxf_id, ..
+                } => {
+                    assert!(formula.starts_with("=AND("));
+                    // dxf_id indexes into the dxfs list we appended to.
+                    assert!((*dxf_id as usize) < dxfs.len());
+                }
+                other => panic!("expected CfRule::Formula, got {other:?}"),
+            }
+        }
+
+        // The two rules reference distinct inline formats.
+        let ids: Vec<u32> = rules
+            .iter()
+            .filter_map(|cf| match &cf.cf_rule {
+                CfRule::Formula { dxf_id, .. } => Some(*dxf_id),
+                _ => None,
+            })
+            .collect();
+        assert_ne!(ids[0], ids[1]);
+        // The "matches" rule (priority 1) gets the green fill.
+        assert_eq!(
+            dxfs[0].fill.as_ref().map(|f| &f.color),
+            Some(&Color::Rgb("#C6EFCE".to_string()))
+        );
     }
 
     #[test]
@@ -712,8 +831,8 @@ mod tests {
             </conditionalFormatting>
         </worksheet>"#;
         let doc = parse_ws(xml);
-        let ws = doc.root_element();
-        let rules = load_conditional_formatting(ws, &dummy_theme()).unwrap();
+        let ws = &doc;
+        let rules = load_conditional_formatting(ws, &dummy_theme(), &mut Vec::new()).unwrap();
         assert_eq!(rules.len(), 3);
         // Excel priority=1 (most important) must map to the highest IronCalc number (3).
         let p: Vec<u32> = rules.iter().map(|r| r.priority).collect();
@@ -746,8 +865,8 @@ mod tests {
             </conditionalFormatting>
         </worksheet>"#;
         let doc = parse_ws(xml);
-        let ws = doc.root_element();
-        let rules = load_conditional_formatting(ws, &dummy_theme()).unwrap();
+        let ws = &doc;
+        let rules = load_conditional_formatting(ws, &dummy_theme(), &mut Vec::new()).unwrap();
         assert_eq!(rules.len(), 1);
         // Single rule: max+1-priority = 5+1-5 = 1
         assert_eq!(rules[0].priority, 1);
@@ -763,8 +882,8 @@ mod tests {
             </conditionalFormatting>
         </worksheet>"#;
         let doc = parse_ws(xml);
-        let ws = doc.root_element();
-        let rules = load_conditional_formatting(ws, &dummy_theme()).unwrap();
+        let ws = &doc;
+        let rules = load_conditional_formatting(ws, &dummy_theme(), &mut Vec::new()).unwrap();
         assert_eq!(rules.len(), 2);
         let above = rules
             .iter()
